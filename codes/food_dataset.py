@@ -112,7 +112,8 @@ def get_robust_transforms(image_size: int = 224) -> A.Compose:
     ])
 
 class FoodDataset(Dataset):
-    def __init__( self, dataframe:  pd.DataFrame, images_dir: str | Path, augment:    bool = True, image_size: int  = 224, minority_classes: list = None) -> None:
+    def __init__( self, dataframe:  pd.DataFrame, images_dir: str | Path, augment: bool = True, 
+                 image_size: int  = 224, minority_classes: list = None) -> None:
         self.df         = dataframe.reset_index(drop=True)
         self.images_dir = Path(images_dir)
         self.augment    = augment
@@ -120,8 +121,8 @@ class FoodDataset(Dataset):
         self.minority_classes = minority_classes if minority_classes is not None else []
 
         # Pre-build both pipelines once — avoids rebuilding per sample.
-        self._robust_tf   = get_robust_transforms(image_size)
-        self._standard_tf = get_transforms(image_size, augment=augment)
+        self.robust_tf   = get_robust_transforms(image_size)
+        self.standard_tf = get_transforms(image_size, augment=augment)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -147,43 +148,7 @@ class FoodDataset(Dataset):
 
 
 
-def audit_images(df, img_dir, min_std=5.0, min_bytes=1500):
-    issues = []
 
-
-    for idx, row in df.iterrows():
-        path = os.path.join(img_dir, str(row['img_name']))
-
-        # 1. File exists?
-        if not os.path.exists(path):
-            issues.append({'idx': idx, 'img_name': row['img_name'],
-                        'label': row['label'], 'reason': 'missing'})
-            continue
-
-        # 2. Truncated file?
-        if os.path.getsize(path) < min_bytes:
-            issues.append({'idx': idx, 'img_name': row['img_name'],
-                        'label': row['label'], 'reason': 'truncated'})
-            continue
-
-        # 3. Readable?
-        try:
-            img = Image.open(path).convert('RGB')
-            arr = np.array(img, dtype=np.float32)
-        except Exception as ex:
-            issues.append({'idx': idx, 'img_name': row['img_name'],
-                        'label': row['label'], 'reason': f'corrupt:{ex}'})
-            continue
-
-        # 4. Blank / near-black / near-white?
-        mean, std = arr.mean(), arr.std()
-        if std < min_std:
-            issues.append({'idx': idx, 'img_name': row['img_name'],
-                        'label': row['label'],
-                        'reason': f'low_variance(std={std:.1f},mean={mean:.1f})'})
-            
-
-    return pd.DataFrame(issues)
 
 
 
