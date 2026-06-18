@@ -44,6 +44,24 @@ from .model import build_model, BaseModel
 
 from .utils import get_device
 
+# Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
+# installed, so the module never hard-depends on it.
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except ImportError:  # pragma: no cover
+    _HAS_TQDM = False
+
+    def tqdm(iterable=None, *args, **kwargs):   # type: ignore
+        return iterable if iterable is not None else _NullBar()
+
+    class _NullBar:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def update(self, *a, **k): pass
+        def set_postfix(self, *a, **k): pass
+        def close(self): pass
+
 
 
 #  Result container 
@@ -206,26 +224,37 @@ def probe_supervised(
     amp_on = use_amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
-    for _ in range(probe_epochs):
+    for epoch in range(1, probe_epochs + 1):
         model.train()
-        for images, labels in train_loader:
+        run_loss, run_correct, run_n = 0.0, 0, 0
+        bar = tqdm(train_loader, desc=f"probe ep {epoch}/{probe_epochs}",
+                   leave=False, unit="batch")
+        for images, labels in bar:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, enabled=amp_on):
-                loss = criterion(model(images), labels)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            # Live training stats on the bar.
+            run_loss += loss.item() * images.size(0)
+            run_correct += (outputs.argmax(1) == labels).sum().item()
+            run_n += labels.size(0)
+            if _HAS_TQDM:
+                bar.set_postfix(loss=f"{run_loss / max(run_n, 1):.3f}",
+                                acc=f"{run_correct / max(run_n, 1):.3f}")
         scheduler.step()
 
     # Validation accuracy (the selection metric).
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for images, labels in val_loader:
+        for images, labels in tqdm(val_loader, desc="probe val", leave=False, unit="batch"):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, enabled=amp_on):
@@ -286,6 +315,7 @@ def grid_search_over_configs(
     if verbose:
         print(f"[tune] {len(configs)} configurations to probe.\n")
 
+    config_bar = tqdm(total=len(configs), desc="configs", unit="cfg") if _HAS_TQDM else None
     for i, cfg in enumerate(configs, 1):
         # Pre-check the param budget WITHOUT training, so doomed configs cost ~0.
         probe_model = build_model(
@@ -300,6 +330,8 @@ def grid_search_over_configs(
             if verbose:
                 print(f"[tune] ({i}/{len(configs)}) SKIP {cfg} — "
                       f"{info['total_params_M']} M ≥ 10 M")
+            if config_bar is not None:
+                config_bar.update(1)
             continue
 
         reset_peak_mem(device)
@@ -313,10 +345,17 @@ def grid_search_over_configs(
             peak_mem_MB=peak, time_s=elapsed, under_10M=True,
         )
         results.append(res)
+        if config_bar is not None:
+            best_so_far = max(r.val_accuracy for r in results)
+            config_bar.set_postfix(last=f"{val_acc:.3f}", best=f"{best_so_far:.3f}")
+            config_bar.update(1)
         if verbose:
             print(f"[tune] ({i}/{len(configs)}) acc={val_acc:.4f} "
                   f"params={info['total_params_M']}M mem={peak:.0f}MB "
                   f"time={elapsed:.0f}s :: {cfg}")
+
+    if config_bar is not None:
+        config_bar.close()
 
     if not results:
         raise RuntimeError("No valid (<10M) configurations were probed.")
