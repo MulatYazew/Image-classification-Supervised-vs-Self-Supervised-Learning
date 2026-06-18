@@ -21,19 +21,19 @@ present in both partitions).
 ```
 251_food_classification_model/
 ├── codes/
-│   ├── config.py            # central, dataset-aware hyperparameters
-│   ├── utils.py             # seeds, device, param-budget guard
-│   ├── data_handler.py      # manifest, stratified split, augmentation, datasets
-│   ├── model.py             # custom CNNs (all verified < 10M params) + registry
-│   ├── loss.py              # CE / weighted-CE / focal + NT-Xent (SimCLR)
-│   ├── train.py             # supervised Trainer + grid_search
-│   ├── self_supervised.py   # SimCLR/rotation pretrain → features → trad. classifier
-│   ├── evaluate.py          # accuracy/precision/recall/F1, confusion, SL-vs-SSL
-│   ├── gradcam.py           # Grad-CAM explanations for the custom CNNs
+│   ├── config.py               # central, dataset-aware hyperparameters
+│   ├── utils.py                # seeds, device, param-budget guard
+│   ├── data_handler.py         # manifest, stratified split, augmentation, datasets
+│   ├── model.py                # custom CNNs (all verified < 10M params) + registry
+│   ├── loss.py                 # CE / weighted-CE / focal + NT-Xent (SimCLR)
+│   ├── train.py                # supervised Trainer + grid_search
+│   ├── self_supervised.py      # SimCLR/rotation pretrain → features → trad. classifier
+│   ├── evaluate.py             # accuracy/precision/recall/F1, confusion, SL-vs-SSL
+│   ├── gradcam.py              # Grad-CAM explanations for the custom CNNs
+│   ├── hyperparamete_tuning.py # 
 │   └── outlier_handler.py   # 3-stage food-image outlier audit
 ├── notebooks/
 │   ├── Food_Supervised_vs_SelfSupervised.ipynb   # main pipeline (both tasks)
-│   └── Food_Outlier_Handling.ipynb               # interactive outlier review
 ├── dataset/                 # put train_labels.csv + train_set/ here
 ├── models/                  # checkpoints (created at runtime)
 └── results/                 # metrics, figures, cleaned manifest
