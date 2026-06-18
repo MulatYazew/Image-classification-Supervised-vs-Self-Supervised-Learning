@@ -1,0 +1,175 @@
+"""
+FoodNet Evaluator
+=================
+Computes the exam-required metrics — accuracy, precision, recall, F1-score —
+plus confusion matrices and a per-class report. Works for BOTH paradigms:
+
+  * Supervised : pass a trained model + DataLoader to "evaluate".
+  * Self-sup.  : pass the SSL pipeline's "val_predictions" / "val_labels"
+                 straight to "metrics_from_predictions" (no model needed).
+
+A "compare_paradigms" helper assembles the SL-vs-SSL table for the report.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report,
+)
+
+
+class Evaluator:
+    """
+    Metrics and visualisations for Food-251 models.
+
+    Args:
+        num_classes : 251.
+        class_names : list of names (length num_classes); auto-filled if None.
+        device      : inference device.
+    """
+
+    def __init__(self, num_classes: int = 251, class_names: list[str] | None = None,
+                 device: torch.device = torch.device("cpu")) -> None:
+        self.num_classes = num_classes
+        self.device = device
+        self.class_names = class_names or [f"class_{i}" for i in range(num_classes)]
+
+    #  Inference 
+
+    @torch.no_grad()
+    def predict(self, model: nn.Module, loader) -> tuple[np.ndarray, np.ndarray]:
+        """Run ``model`` over ``loader``; return (predictions, true_labels)."""
+        model = model.to(self.device).eval()
+        preds, labels = [], []
+        for images, lbls in loader:
+            images = images.to(self.device)
+            preds.extend(model(images).argmax(1).cpu().numpy())
+            labels.extend(lbls.numpy())
+        return np.array(preds), np.array(labels)
+
+    #  Metrics 
+
+    @staticmethod
+    def metrics_from_predictions(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+        """
+        Accuracy + macro & weighted precision/recall/F1.
+
+        Macro treats every one of the 251 classes equally (so the small classes
+        count as much as the big ones); weighted accounts for support.
+        """
+        return {
+            "accuracy": accuracy_score(y_true, y_pred),
+            "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
+            "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
+            "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
+            "precision_weighted": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+            "recall_weighted": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+            "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+        }
+
+    def compute_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+        return self.metrics_from_predictions(y_true, y_pred)
+
+    def print_report(self, y_true: np.ndarray, y_pred: np.ndarray, max_classes: int = 30) -> None:
+        """Print the sklearn classification report (truncated for 251 classes)."""
+        names = self.class_names if self.num_classes <= max_classes else None
+        print(classification_report(y_true, y_pred, target_names=names, zero_division=0))
+
+    @staticmethod
+    def top_k_accuracy(model: nn.Module, loader, device, k: int = 5) -> float:
+        """Top-k accuracy — a fairer headline metric for 251 fine-grained classes."""
+        model = model.to(device).eval()
+        correct, n = 0, 0
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(device)
+                topk = model(images).topk(k, dim=1).indices.cpu()
+                correct += sum(labels[i] in topk[i] for i in range(len(labels)))
+                n += len(labels)
+        return correct / max(n, 1)
+
+    #  Confusion matrix 
+
+    def plot_confusion_matrix(self, y_true, y_pred, figsize=(12, 10), normalize=True,
+                              annotate=False, save_path: str | None = None) -> None:
+        """
+        Confusion-matrix heatmap. For 251 classes the cells are tiny, so the
+        default omits annotations and normalises by true-label counts to reveal
+        systematic confusions between similar dishes.
+        """
+        cm = confusion_matrix(y_true, y_pred)
+        fmt = "d"
+        if normalize:
+            cm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
+            fmt = ".2f"
+        plt.figure(figsize=figsize)
+        sns.heatmap(cm, annot=annotate, fmt=fmt, cmap="viridis",
+                    cbar_kws={"label": "Rate" if normalize else "Count"})
+        plt.title("Confusion Matrix" + (" (normalized)" if normalize else ""))
+        plt.ylabel("True label")
+        plt.xlabel("Predicted label")
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=120, bbox_inches="tight")
+        plt.show()
+
+    #  Full pipeline 
+
+    def evaluate(self, model: nn.Module, loader) -> dict:
+        """Predict → metrics → confusion matrix (supervised path)."""
+        y_pred, y_true = self.predict(model, loader)
+        return {
+            "predictions": y_pred,
+            "true_labels": y_true,
+            "metrics": self.compute_metrics(y_true, y_pred),
+            "confusion_matrix": confusion_matrix(y_true, y_pred),
+        }
+
+
+#  SL vs SSL comparison 
+
+def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> "pd.DataFrame":  # noqa: F821
+    """
+    Build the headline SL-vs-SSL comparison table for the report.
+
+    Args:
+        sl_metrics  : Evaluator metrics dict from the supervised model.
+        ssl_metrics : Evaluator metrics dict from the SSL + traditional-classifier
+                      pipeline (via metrics_from_predictions on val_predictions).
+    """
+
+    keys = ["accuracy", "f1_macro", "f1_weighted",
+            "precision_macro", "recall_macro"]
+    rows = []
+    for k in keys:
+        sl = sl_metrics.get(k, float("nan"))
+        ssl = ssl_metrics.get(k, float("nan"))
+        rows.append({
+            "metric": k,
+            "Supervised (SL)": round(sl, 4),
+            "Self-Supervised (SSL)": round(ssl, 4),
+            "Δ (SL − SSL)": round(sl - ssl, 4),
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_training_curves(history: dict, save_path: str | None = None) -> None:
+    """Plot train/val loss and accuracy curves from a Trainer history dict."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    ax1.plot(history["train_loss"], label="train")
+    ax1.plot(history["val_loss"], label="val")
+    ax1.set_title("Loss"); ax1.set_xlabel("epoch"); ax1.legend()
+    ax2.plot(history["train_acc"], label="train")
+    ax2.plot(history["val_acc"], label="val")
+    ax2.set_title("Accuracy"); ax2.set_xlabel("epoch"); ax2.legend()
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.show()

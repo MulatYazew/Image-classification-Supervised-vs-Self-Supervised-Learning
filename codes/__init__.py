@@ -1,0 +1,1 @@
+"""Food-251 classification package — custom CNNs for Supervised vs Self-Supervised learning."""
