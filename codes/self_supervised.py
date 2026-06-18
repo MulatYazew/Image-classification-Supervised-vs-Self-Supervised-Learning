@@ -44,8 +44,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from loss_function import NTXentLoss
-from utils import get_device
+from .loss_function import NTXentLoss
+from .utils import get_device
 
 
 

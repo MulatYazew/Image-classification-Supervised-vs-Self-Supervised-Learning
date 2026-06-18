@@ -40,9 +40,9 @@ import torch.nn.functional as F
 from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from model import build_model, BaseModel
+from .model import build_model, BaseModel
 
-from utils import get_device
+from .utils import get_device
 
 
 
