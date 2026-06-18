@@ -77,6 +77,14 @@ WIDTH_MULT = 1.0           # global channel multiplier; lower to shrink the mode
 LOSS_TYPE   = "weighted_ce"
 FOCAL_GAMMA = 2.0
 USE_WEIGHTED_SAMPLER = False   # pick ONE correction point (sampler XOR loss weights)
+# Per-class weight scheme for compute_class_weights: "inv" | "sqrt_inv" | "effective".
+CLASS_WEIGHT_SCHEME = "sqrt_inv"
+
+#  Hyperparameter tuning 
+# Short probe budget per configuration during the search (the winner is then
+# trained to convergence with NUM_EPOCHS / SSL_EPOCHS).
+TUNE_PROBE_EPOCHS     = 5
+SSL_TUNE_PROBE_EPOCHS = 10
 
 #  Self-Supervised Learning (pretext) 
 # SSL pretrains the SAME custom backbone on the images WITHOUT labels, then we

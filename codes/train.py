@@ -2,7 +2,7 @@
 FoodNet Supervised Trainer
 ===========================
 Training loop for the SUPERVISED (SL) task:
-  - configurable loss (CE / weighted-CE / focal, via codes.loss.build_criterion)
+  - configurable loss (CE / weighted-CE / focal, via codes.loss_function.build_criterion)
   - AdamW + CosineAnnealingLR
   - gradient clipping (stabilises from-scratch training)
   - early stopping on validation loss
@@ -32,7 +32,7 @@ class Trainer:
     Args:
         model         : a codes.model BaseModel instance.
         device        : torch.device.
-        criterion     : loss module (from codes.loss.build_criterion). If None,
+        criterion     : loss module (from codes.loss_function.build_criterion). If None,
                         falls back to plain CrossEntropyLoss with class_weights.
         learning_rate : initial LR.
         weight_decay  : AdamW weight decay.
@@ -59,9 +59,7 @@ class Trainer:
 
         self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-        # Mixed precision: ~2x faster and ~half the memory on CUDA. GradScaler is
-        # only meaningful for fp16 on CUDA; on MPS/CPU we run autocast without
-        # scaling (or disabled), so behaviour is unchanged there.
+        # Mixed precision: ~2x faster and ~half the memory on CUDA.
         self.use_amp = use_amp and device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 

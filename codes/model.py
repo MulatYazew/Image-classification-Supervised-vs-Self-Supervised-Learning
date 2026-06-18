@@ -11,7 +11,7 @@ pipeline (train / evaluate / SSL / tuning) is architecture-agnostic:
   ┌──────────────────┬───────────┬──────────────────────────────────────────────┐
   │ Model            │ Params*   │ Role                                         │
   ├──────────────────┼───────────┼──────────────────────────────────────────────┤
-  │ FoodNet          │ < 10  M   │ PROPOSED model — residual DWS + SE           │
+  │ FoodNet          │ < 7.642  M   │ PROPOSED model — residual DWS + SE           │
   │ FoodNetLite      │ ~0.45 M   │ Lightweight baseline for comparison/ablation │
   └──────────────────┴───────────┴──────────────────────────────────────────────┘
   * measured at width_mult=1.0, num_classes=251, 224x224 input (see __main__).
@@ -84,7 +84,7 @@ def make_head(in_features: int, num_classes: int = 251, dropout: float = 0.3,
 
 class BaseModel(ABC, nn.Module):
     """
-    Shared interface for every Food-251 architecture.
+    Shared interface for every FoodNet architecture.
 
     Subclasses MUST implement ``build()`` (construct ``self.backbone`` and
     ``self.head`` and set ``self.feature_dim``) and ``forward_features()``.
@@ -263,7 +263,7 @@ class DepthwiseSeparable(nn.Module):
         return self.act(out)
 
 
-#  Food251Net  (PROPOSED — residual depthwise-separable + SE) 
+#  FoodNet  (PROPOSED — residual depthwise-separable + SE) 
 
 class FoodNet(BaseModel):
     """
@@ -285,7 +285,7 @@ class FoodNet(BaseModel):
     gradient a clean path so those blocks actually contribute. feature_dim=1024.
     """
 
-    NAME = "food251net"
+    NAME = "foodnet"
 
     def build(self) -> None:
         w = self.width_mult
@@ -341,7 +341,7 @@ class FoodNetLite(BaseModel):
     hyper-parameter sweeps before committing to the full Food251Net.
     """
 
-    NAME = "food251net_lite"
+    NAME = "foodnet_lite"
 
     def build(self) -> None:
         w = self.width_mult

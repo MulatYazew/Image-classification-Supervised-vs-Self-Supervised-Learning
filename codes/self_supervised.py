@@ -24,7 +24,8 @@ trained* (with vs without labels).
 Efficiency notes
 -------------------------------------------------------------------------
   * Mixed-precision (AMP) autocast + GradScaler — ~2x faster, half the memory,
-    on any modern GPU. Enabled automatically when CUDA is available.
+    on CUDA. Enabled automatically when the resolved device is CUDA; on MPS
+    (Apple Silicon) / CPU the pretraining runs full precision (no crash, no AMP).
   * SimCLR LR is scaled linearly with batch size (lr = base_lr * B / 256), the
     standard SimCLR rule — contrastive learning is very batch-size sensitive.
   * The traditional classifier defaults to a fast SAGA logistic regression;
@@ -44,6 +45,8 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from loss_function import NTXentLoss
+from utils import get_device
+
 
 
 #  Projection head (SimCLR) 
@@ -106,8 +109,9 @@ def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs
     optimizer = AdamW(list(backbone.parameters()) + list(proj.parameters()),
                       lr=scaled_lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    # AMP only helps on CUDA, so keep it gated to CUDA — but key the scaler
     amp_on = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler('cuda', enabled=amp_on)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
     history: dict[str, list[float]] = {"ssl_loss": []}
     t0 = time.time()
@@ -117,7 +121,7 @@ def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs
         for view1, view2 in ssl_loader:
             view1, view2 = view1.to(device, non_blocking=True), view2.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=amp_on):
+            with torch.amp.autocast(device.type, enabled=amp_on):
                 z1 = proj(backbone.forward_features(view1))   # project both views …
                 z2 = proj(backbone.forward_features(view2))
                 loss = criterion(z1, z2)                       # … and contrast them
@@ -173,7 +177,7 @@ def pretrain_rotation(
                       lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     amp_on = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler('cuda', enabled=amp_on)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
     history: dict[str, list[float]] = {"ssl_loss": [], "ssl_acc": []}
     t0 = time.time()
@@ -195,7 +199,7 @@ def pretrain_rotation(
             y = torch.cat(targets, dim=0)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=amp_on):
+            with torch.amp.autocast(device.type, enabled=amp_on):
                 logits = rot_head(backbone.forward_features(x))
                 loss = criterion(logits, y)
             scaler.scale(loss).backward()
@@ -300,7 +304,7 @@ def run_ssl_pipeline(
     ssl_loader,
     train_feat_loader,
     val_feat_loader,
-    device: torch.device,
+    device: torch.device | None = None,
     method: str = "simclr",
     classifier: str = "logreg",
     epochs: int = 100,
@@ -315,11 +319,15 @@ def run_ssl_pipeline(
     End-to-end SSL task: pretrain → freeze → extract features → fit & score a
     traditional classifier on train/val (= test) splits.
 
+    ``device`` defaults to ``utils.get_device()`` when omitted, so the pipeline
+    resolves to MPS on the Mac and CUDA on a CUDA PC with no edits.
+
     Returns a dict with the SSL training history, the fitted classifier, the
     extracted feature arrays, and validation predictions/labels (hand these to
     codes.evaluate.Evaluator for the SAME metrics used in the SL task, so the
     SL-vs-SSL comparison is apples-to-apples).
     """
+    device = device or get_device()
     if method == "simclr":
         hist = pretrain_simclr(backbone, ssl_loader, device, epochs=epochs, lr=lr,
                                weight_decay=weight_decay, temperature=temperature,

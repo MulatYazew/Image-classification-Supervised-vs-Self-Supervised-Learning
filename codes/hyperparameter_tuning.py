@@ -96,17 +96,24 @@ def default_sl_grid() -> dict[str, list]:
 
 def default_ssl_grid() -> dict[str, list]:
     """
-    Self-supervised (SimCLR) grid. ``temperature`` and ``batch_size`` are the
-    contrastive-specific knobs that matter most; ``classifier`` selects the
-    downstream traditional model used to read out the frozen features.
+    Self-supervised grid (applies to whichever pretext method you tune).
+
+    The method itself (simclr or rotation) is NOT a grid axis here, because the
+    two pretext tasks consume differently shaped inputs (SimCLR needs augmented
+    pairs, rotation needs single images) and therefore different DataLoaders.
+    Instead you run tune_ssl once per method and compare the winners — exactly
+    the SL-vs-SSL-vs-method workflow the report asks for.
+
+    temperature only affects SimCLR; it is ignored for rotation. classifier
+    selects the downstream traditional read-out and is tuned too.
     """
     return {
         "model_name":  ["foodnet"],
         "lr":          [5e-4, 1e-3],
-        "temperature": [0.1, 0.5],               # NT-Xent sharpness (lower = harder)
+        "temperature": [0.1, 0.5],               # NT-Xent sharpness (SimCLR only; lower = harder)
         "weight_decay": [1e-4],
         "projection_dim": [128],
-        "classifier":  ["logreg", "knn"],        # downstream read-out
+        "classifier":  ["logreg", "linear_svm", "knn"],        # downstream read-out (tuned)
         "width_mult":  [1.0, 0.75],
     }
 
@@ -255,8 +262,27 @@ def grid_search(
         (best_result, all_results) — ``all_results`` is ready to write to CSV
         for the report's tuning table.
     """
-    results: list[TrialResult] = []
     configs = list(iter_grid(grid))
+    return grid_search_over_configs(
+        configs, probe_fn, device, tie_tol=tie_tol, verbose=verbose, **probe_kwargs
+    )
+
+
+def grid_search_over_configs(
+    configs: list[dict],
+    probe_fn: Callable[..., tuple[float, BaseModel]],
+    device: torch.device,
+    tie_tol: float = 0.005,
+    verbose: bool = True,
+    **probe_kwargs,
+) -> tuple[TrialResult, list[TrialResult]]:
+    """
+    Core driver shared by grid_search (SL) and tune_ssl (SSL): evaluate an
+    explicit list of config dicts with probe_fn and pick the best under the same
+    <10M / accuracy / cheap-tie-break rule. Taking a config LIST (not a grid)
+    lets the SSL path drop redundant rotation-vs-temperature duplicates first.
+    """
+    results: list[TrialResult] = []
     if verbose:
         print(f"[tune] {len(configs)} configurations to probe.\n")
 
@@ -358,26 +384,122 @@ def tune_supervised(
     return best, results
 
 
-if __name__ == "__main__":
-    # Smoke test on synthetic data (CPU) — proves the search loop & selection.
-    from torch.utils.data import TensorDataset, DataLoader
-    torch.manual_seed(0)
-    N, C = 48, 5
-    imgs = torch.randn(N, 3, 64, 64)
-    labs = torch.randint(0, C, (N,))
-    loader = DataLoader(TensorDataset(imgs, labs), batch_size=16)
 
-    tiny_grid = {
-        "model_name": ["foodnet_lite"],
-        "lr": [1e-3, 3e-3],
-        "optimizer": ["adamw"],
-        "weight_decay": [1e-4],
-        "dropout": [0.2],
-        "width_mult": [1.0],
-        "label_smoothing": [0.0, 0.1],
-    }
-    best, all_res = tune_supervised(
-        loader, loader, get_device(),
-        grid=tiny_grid, probe_epochs=1, num_classes=C,
+
+#  SSL probe + tuner (run once per pretext method) 
+
+def probe_ssl(
+    cfg: dict,
+    ssl_loader,
+    train_feat_loader,
+    val_feat_loader,
+    device: torch.device,
+    method: str = "simclr",
+    probe_epochs: int = 10,
+    num_classes: int = 251,
+    use_amp: bool = True,
+) -> tuple[float, BaseModel]:
+    """
+    One SSL trial under cfg: short pretrain (no labels) -> freeze -> extract
+    features -> fit the chosen traditional classifier -> return its validation
+    accuracy. Mirrors probe_supervised's (val_acc, model) contract so the SAME
+    search driver works for SSL. method is fixed per call (simclr or rotation).
+    """
+    from .self_supervised import (
+        pretrain_simclr, pretrain_rotation, extract_features,
+        fit_traditional_classifier,
     )
-    print("\nbest row:", best.row())
+    from sklearn.metrics import accuracy_score
+
+    backbone = build_model(
+        cfg["model_name"], num_classes=num_classes,
+        dropout=cfg.get("dropout", 0.3), width_mult=cfg.get("width_mult", 1.0),
+    ).to(device)
+
+    if method == "simclr":
+        pretrain_simclr(
+            backbone, ssl_loader, device,
+            epochs=probe_epochs, lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-4),
+            temperature=cfg.get("temperature", 0.5),
+            projection_dim=cfg.get("projection_dim", 128), use_amp=use_amp,
+        )
+    elif method == "rotation":
+        pretrain_rotation(
+            backbone, ssl_loader, device,
+            epochs=probe_epochs, lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-4),
+            use_amp=use_amp,
+        )
+    else:
+        raise ValueError(f"Unknown SSL method '{method}'. Choose: simclr, rotation.")
+
+    Xtr, ytr = extract_features(backbone, train_feat_loader, device)
+    Xva, yva = extract_features(backbone, val_feat_loader, device)
+    clf = fit_traditional_classifier(Xtr, ytr, classifier=cfg.get("classifier", "logreg"))
+    val_acc = accuracy_score(yva, clf.predict(Xva))
+    return val_acc, backbone
+
+
+def deduplicate_ssl_configs(configs: list[dict], method: str) -> list[dict]:
+    """
+    For rotation, temperature is irrelevant, so the grid's temperature axis
+    creates identical duplicate configs. Collapse them to one per unique config.
+    SimCLR configs are returned unchanged.
+    """
+    if method != "rotation":
+        return configs
+    seen, kept = set(), []
+    for cfg in configs:
+        c = dict(cfg); c.pop("temperature", None)
+        key = tuple(sorted(c.items()))
+        if key not in seen:
+            seen.add(key); kept.append(cfg)
+    return kept
+
+
+def tune_ssl(
+    ssl_loader,
+    train_feat_loader,
+    val_feat_loader,
+    method: str = "simclr",
+    device: torch.device | None = None,
+    grid: dict[str, list] | None = None,
+    probe_epochs: int = 10,
+    num_classes: int = 251,
+    csv_path: str | None = None,
+) -> tuple[TrialResult, list[TrialResult]]:
+    """
+    Tune ONE SSL pretext method (simclr or rotation). Returns (best, all_results).
+
+    Run it once per method with the matching loader (SimCLR: augmented-pair
+    loader; rotation: single-image loader), then compare the two winners'
+    val_accuracy to choose the better paradigm.
+
+    device defaults to utils.get_device() (MPS on the Mac, CUDA on a CUDA PC).
+    """
+    device = device or get_device()
+    grid = grid or default_ssl_grid()
+    configs = deduplicate_ssl_configs(list(iter_grid(grid)), method)
+    print(f"[tune-ssl:{method}] {len(configs)} configs to probe.")
+
+    best, results = grid_search_over_configs(
+        configs, probe_ssl, device,
+        ssl_loader=ssl_loader,
+        train_feat_loader=train_feat_loader,
+        val_feat_loader=val_feat_loader,
+        method=method, probe_epochs=probe_epochs, num_classes=num_classes,
+    )
+    if csv_path:
+        results_to_csv(results, csv_path)
+    print(f"[tune-ssl:{method}] BEST val_acc={best.val_accuracy:.4f} :: {best.config}")
+    return best, results
+
+
+def compare_ssl_methods(simclr_best: TrialResult, rotation_best: TrialResult) -> dict:
+    """
+    Compare the two tuned SSL winners and name the better pretext method.
+    Returns {"winner": "simclr"|"rotation", "simclr_acc":.., "rotation_acc":..}.
+    """
+    sa, ra = simclr_best.val_accuracy, rotation_best.val_accuracy
+    winner = "simclr" if sa >= ra else "rotation"
+    print(f"[ssl-compare] simclr={sa:.4f} | rotation={ra:.4f} -> winner: {winner}")
+    return {"winner": winner, "simclr_acc": sa, "rotation_acc": ra}
