@@ -1,5 +1,5 @@
 
-# Food — Supervised vs Self-Supervised Learning
+# FoodNet — Supervised vs Self-Supervised Learning
 
 Custom-CNN image classification on the **Food-251** dataset (251 classes, 100–600
 images/class, uncontrolled input size), solved under **two paradigms** as required
