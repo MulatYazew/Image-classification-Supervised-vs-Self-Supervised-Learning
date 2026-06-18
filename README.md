@@ -32,8 +32,8 @@ present in both partitions).
 │   ├── gradcam.py           # Grad-CAM explanations for the custom CNNs
 │   └── outlier_handler.py   # 3-stage food-image outlier audit
 ├── notebooks/
-│   ├── Food251_Supervised_vs_SelfSupervised.ipynb   # main pipeline (both tasks)
-│   └── Food251_Outlier_Handling.ipynb               # interactive outlier review
+│   ├── Food_Supervised_vs_SelfSupervised.ipynb   # main pipeline (both tasks)
+│   └── Food_Outlier_Handling.ipynb               # interactive outlier review
 ├── dataset/                 # put train_labels.csv + train_set/ here
 ├── models/                  # checkpoints (created at runtime)
 └── results/                 # metrics, figures, cleaned manifest
@@ -49,9 +49,8 @@ Images live in `dataset/train_set/`. String labels are auto-mapped to integer id
 
 | Model              | Params | Feature dim | Role                                  |
 |--------------------|--------|-------------|---------------------------------------|
-| `food251net`       | ~4.1 M | 1024        | Proposed — depthwise-separable CNN    |
-| `food251net_lite`  | ~0.45 M| 256         | Lightweight baseline / fast sweeps    |
-| `resnet_custom`    | ~6.6 M | 384         | From-scratch residual comparison      |
+| `foodnet`          | ~4.1 M | 1024        | Proposed — depthwise-separable CNN    |
+| `foodnet_lite`     | ~0.45 M| 256         | Lightweight baseline / fast sweeps    |
 
 Verify any time with:
 
