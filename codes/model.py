@@ -275,7 +275,7 @@ class DropPath(nn.Module):
     samples in the batch. At test time the full residual is used.
 
     This is strictly better than standard Dropout for residual networks because
-    it drops the *structural path*, not individual activations, and allows the
+    it drops the structural path, not individual activations, and allows the
     network to effectively learn with a shallower depth on some samples.
     """
 

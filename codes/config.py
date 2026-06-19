@@ -25,13 +25,14 @@ SEED = 42
 
 #  Device 
 # Priority handled in utils.get_device(): MPS (Apple Silicon) → CUDA → CPU.
-DEVICE = "mps"
+DEVICE = "auto"   # auto → CUDA if available, else MPS (Apple Silicon), else CPU
 
 #  Paths 
 # codes/ is one level below the project root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR     = PROJECT_ROOT / "dataset"
 IMAGE_DIR    = DATA_DIR / "train_set"            # raw training images
+TEST_IMAGE_DIR = DATA_DIR / "test_set"
 TRAIN_CSV    = DATA_DIR / "train_labels.csv"     # manifest: image_id,label of training data
 TEST_CSV     = DATA_DIR / "test_labels.csv"      # manifest: image_id, label of the test data
 CLEAN_CSV    = PROJECT_ROOT / "results" / "train_labels_clean.csv"  # post-outlier manifest
@@ -54,33 +55,25 @@ STRATIFY   = True
 # Set to an int (e.g. 250) to cap, or None to use every available image.
 MAX_IMAGES_PER_CLASS = None
 
-#  Supervised-Learning training
-BATCH_SIZE      = 64
-NUM_EPOCHS      = 100     # from-scratch training needs more epochs than fine-tuning
-LEARNING_RATE   = 1e-3    # initial LR (before warmup); cosine decays to eta_min
-WEIGHT_DECAY    = 1e-4
-LABEL_SMOOTHING = 0.1     # mild smoothing helps with 251 fine-grained classes
-
-# LR warmup: ramp from 0.1× → 1× LR over this many epochs before cosine decay.
-# Critical for from-scratch training — prevents early instability that causes
-# poor local minima.
-LR_WARMUP_EPOCHS = 5
+#  Supervised-Learning training 
+BATCH_SIZE    = 64
+NUM_EPOCHS    = 80
+LEARNING_RATE = 5e-4       # v2: lowered from 1e-3; more stable for deep from-scratch nets
+WEIGHT_DECAY  = 1e-4
+LABEL_SMOOTHING = 0.1      # mild smoothing helps with 251 fine-grained classes
 
 # num_workers > 0 can hang on macOS with some DataLoader configs; keep low.
 NUM_WORKERS = 0
 
-#  Custom model
+#  Custom model 
 # No pretrained backbones are allowed. Choose among the custom architectures
 # defined in model.py — every option is verified < 10 M parameters.
-# Choices:
-#   "foodnet_v2"   — PROPOSED: MBConv + SE + DropPath + Hard-Swish (~7.6 M)
-#   "foodnet"      — original DWS + SE (~7.6 M, kept for ablation)
-#   "foodnet_lite" — lightweight baseline (~0.45 M, too small for production)
-MODEL_ARCHITECTURE = "foodnet_v2"
-DROPOUT    = 0.3
+# Choices: "food251net" (proposed) | "food251net_lite" (baseline)
+MODEL_ARCHITECTURE = "foodnet"
+DROPOUT = 0.3
 WIDTH_MULT = 1.0           # global channel multiplier; lower to shrink the model
 
-#  Loss / imbalance handling
+#  Loss / imbalance handling 
 # 100–600 images per class → moderate imbalance. Options: "ce" | "weighted_ce" | "focal".
 LOSS_TYPE   = "weighted_ce"
 FOCAL_GAMMA = 2.0
@@ -88,7 +81,7 @@ USE_WEIGHTED_SAMPLER = False   # pick ONE correction point (sampler XOR loss wei
 # Per-class weight scheme for compute_class_weights: "inv" | "sqrt_inv" | "effective".
 CLASS_WEIGHT_SCHEME = "sqrt_inv"
 
-#  Hyperparameter tuning
+#  Hyperparameter tuning 
 # Short probe budget per configuration during the search (the winner is then
 # trained to convergence with NUM_EPOCHS / SSL_EPOCHS).
 TUNE_PROBE_EPOCHS     = 5
@@ -111,11 +104,13 @@ SSL_CLASSIFIER      = "logreg"
 
 #  Augmentation 
 AUGMENTATION_INTENSITY = 0.5
-USE_MIXUP = False
-
-#  Early stopping
-# Increased to 15 because from-scratch training on 251 classes can
-# plateau for several epochs before finding a better optimum. Aggressive
-# stopping at 8 epochs was cutting runs short before convergence.
-PATIENCE  = 15
+USE_MIXUP    = True
+MIXUP_ALPHA  = 0.2    # Beta(0.2, 0.2) — strong regularisation for 251-class food task
+WARMUP_EPOCHS = 5     # Linear LR ramp before cosine annealing; prevents early BN instability
+AUGMENTATION_INTENSITY = 0.5
+USE_MIXUP    = True
+MIXUP_ALPHA  = 0.2    # Beta(0.2, 0.2) — strong regularisation for 251-class food task
+WARMUP_EPOCHS = 5     # Linear LR ramp before cosine annealing; prevents early BN instability
+#  Early stopping 
+PATIENCE  = 12             # v2: increased from 8; improved model needs more time to settle
 MIN_DELTA = 1e-4

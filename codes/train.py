@@ -23,11 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
-    LinearLR,
-    SequentialLR,
-)
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 # Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
 # trainer never hard-depends on it.
@@ -64,6 +60,7 @@ class Trainer:
         weight_decay: float = 1e-4,
         class_weights: Optional[torch.Tensor] = None,
         use_amp: bool = True,
+        mixup_alpha: float = 0.0,
     ) -> None:
         self.model = model.to(device)
         self.device = device
@@ -79,6 +76,9 @@ class Trainer:
         self.use_amp = use_amp and device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
+        # MixUp: alpha=0 disables it; alpha=0.2 is a strong food-vision default.
+        self.mixup_alpha = mixup_alpha
+
         self.history: dict[str, list[float]] = {
             "train_loss": [], "val_loss": [], "train_acc": [], "val_acc": [], "lr": [],
         }
@@ -87,9 +87,17 @@ class Trainer:
 
     #  Single epoch 
 
+    def _mixup_batch(self, images: torch.Tensor, labels: torch.Tensor):
+        """Apply MixUp to a batch.  Returns (mixed_images, y_a, y_b, lam)."""
+        lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+        idx = torch.randperm(images.size(0), device=images.device)
+        mixed = lam * images + (1.0 - lam) * images[idx]
+        return mixed, labels, labels[idx], lam
+
     def run_epoch(self, loader, training: bool, desc: str | None = None) -> tuple[float, float]:
         self.model.train(training)
         total_loss, correct, n = 0.0, 0, 0
+        use_mixup = training and self.mixup_alpha > 0.0
         ctx = torch.enable_grad() if training else torch.no_grad()
         bar = tqdm(loader, desc=desc or ("train" if training else "val"),
                    leave=False, unit="batch")
@@ -97,20 +105,36 @@ class Trainer:
             for images, labels in bar:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
+
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, labels)
+
+                if use_mixup:
+                    images, y_a, y_b, lam = self._mixup_batch(images, labels)
+                    with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                        outputs = self.model(images)
+                        # MixUp loss = weighted sum of the two constituent losses.
+                        loss = lam * self.criterion(outputs, y_a) + \
+                               (1.0 - lam) * self.criterion(outputs, y_b)
+                    # Accuracy: credit the dominant label when lam >= 0.5.
+                    pred = outputs.argmax(1)
+                    hits = (lam * (pred == y_a).float() +
+                            (1.0 - lam) * (pred == y_b).float()).sum().item()
+                else:
+                    with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                        outputs = self.model(images)
+                        loss = self.criterion(outputs, labels)
+                    hits = (outputs.argmax(1) == labels).sum().item()
+
                 if training:
-                    # GradScaler path (CUDA fp16): scale → unscale → clip → step.
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+
                 total_loss += loss.item() * images.size(0)
-                correct += (outputs.argmax(1) == labels).sum().item()
+                correct += hits
                 n += labels.size(0)
                 if _HAS_TQDM:
                     bar.set_postfix(loss=f"{total_loss / max(n, 1):.3f}",
@@ -123,20 +147,20 @@ class Trainer:
         self,
         train_loader,
         val_loader,
-        num_epochs: int = 100,
-        patience: int = 15,
+        num_epochs: int = 60,
+        patience: int = 8,
         model_save_dir: str = "models",
         run_name: str = "supervised",
         warmup_frozen_epochs: int = 0,
-        lr_warmup_epochs: int = 5,
+        warmup_epochs: int = 5,
     ) -> dict[str, list[float]]:
         """
-        Train with linear LR warmup → cosine annealing, and early stopping.
+        Train with linear LR warmup → cosine annealing and early stopping.
 
-        ``lr_warmup_epochs`` ramps the LR from 0.1× up to the initial value
-        over the first N epochs, then cosine-decays for the remainder. This is
-        critical for stable from-scratch training: cold-starting at full LR
-        causes chaotic early updates that push the model into poor basins.
+        ``warmup_epochs`` linearly ramps the LR from start_factor × base_lr up
+        to base_lr over the first N epochs, then cosine-anneals to eta_min.
+        This prevents the large initial LR from destabilising BN statistics on
+        the first batch, which is especially harmful for deep from-scratch nets.
 
         ``warmup_frozen_epochs`` > 0 trains only the head for that many epochs
         (backbone frozen) before unfreezing — useful when starting from
@@ -145,24 +169,15 @@ class Trainer:
         save_dir = Path(model_save_dir) / run_name
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build scheduler: linear warm-up → cosine decay.
-        # SequentialLR chains two schedulers at ``milestones=[lr_warmup_epochs]``.
-        warmup_sched = LinearLR(
-            self.optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=max(1, lr_warmup_epochs),
-        )
-        cosine_sched = CosineAnnealingLR(
-            self.optimizer,
-            T_max=max(1, num_epochs - lr_warmup_epochs),
-            eta_min=1e-6,
-        )
-        scheduler = SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_sched, cosine_sched],
-            milestones=[lr_warmup_epochs],
-        )
+        # LR schedule: linear warmup then cosine annealing.
+        warmup_epochs = max(1, warmup_epochs)
+        cosine_epochs = max(1, num_epochs - warmup_epochs)
+        warmup_sched = LinearLR(self.optimizer, start_factor=0.1, end_factor=1.0,
+                                total_iters=warmup_epochs)
+        cosine_sched = CosineAnnealingLR(self.optimizer, T_max=cosine_epochs, eta_min=1e-6)
+        scheduler = SequentialLR(self.optimizer,
+                                 schedulers=[warmup_sched, cosine_sched],
+                                 milestones=[warmup_epochs])
 
         # Optional frozen warm-up (e.g. linear-probe phase on SSL weights).
         if warmup_frozen_epochs > 0 and hasattr(self.model, "freeze_backbone"):
