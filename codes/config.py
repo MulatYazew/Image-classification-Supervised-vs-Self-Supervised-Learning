@@ -68,7 +68,7 @@ NUM_WORKERS = 0
 # No pretrained backbones are allowed. Choose among the custom architectures
 # defined in model.py — every option is verified < 10 M parameters.
 # Choices: "food251net" (proposed) | "food251net_lite" (baseline)
-MODEL_ARCHITECTURE = "foodnet"
+MODEL_ARCHITECTURE = "foodnet_lite"
 DROPOUT = 0.3
 WIDTH_MULT = 1.0           # global channel multiplier; lower to shrink the model
 

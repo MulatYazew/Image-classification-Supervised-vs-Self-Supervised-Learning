@@ -19,10 +19,22 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
+# trainer never hard-depends on it.
+try:
+    from tqdm.auto import tqdm
+    _HAS_TQDM = True
+except ImportError:  # pragma: no cover
+    _HAS_TQDM = False
+
+    def tqdm(iterable=None, *args, **kwargs):   # type: ignore
+        return iterable if iterable is not None else iter(())
 
 
 class Trainer:
@@ -71,12 +83,14 @@ class Trainer:
 
     #  Single epoch 
 
-    def run_epoch(self, loader, training: bool) -> tuple[float, float]:
+    def run_epoch(self, loader, training: bool, desc: str | None = None) -> tuple[float, float]:
         self.model.train(training)
         total_loss, correct, n = 0.0, 0, 0
         ctx = torch.enable_grad() if training else torch.no_grad()
+        bar = tqdm(loader, desc=desc or ("train" if training else "val"),
+                   leave=False, unit="batch")
         with ctx:
-            for images, labels in loader:
+            for images, labels in bar:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
                 if training:
@@ -94,6 +108,9 @@ class Trainer:
                 total_loss += loss.item() * images.size(0)
                 correct += (outputs.argmax(1) == labels).sum().item()
                 n += labels.size(0)
+                if _HAS_TQDM:
+                    bar.set_postfix(loss=f"{total_loss / max(n, 1):.3f}",
+                                    acc=f"{correct / max(n, 1):.3f}")
         return total_loss / max(n, 1), correct / max(n, 1)
 
     #  Full loop 
@@ -130,8 +147,10 @@ class Trainer:
                 self.model.unfreeze_backbone()
                 print(f"  → backbone unfrozen at epoch {epoch}")
 
-            train_loss, train_acc = self.run_epoch(train_loader, training=True)
-            val_loss, val_acc = self.run_epoch(val_loader, training=False)
+            train_loss, train_acc = self.run_epoch(
+                train_loader, training=True, desc=f"epoch {epoch}/{num_epochs} train")
+            val_loss, val_acc = self.run_epoch(
+                val_loader, training=False, desc=f"epoch {epoch}/{num_epochs} val")
             scheduler.step()
             lr = self.optimizer.param_groups[0]["lr"]
 
@@ -162,3 +181,160 @@ class Trainer:
         print(f"\nTraining finished in {(time.time() - t0) / 60:.1f} min.")
         return self.history
 
+    #  Evaluation / inference 
+
+    @torch.no_grad()
+    def evaluate(self, loader) -> dict[str, float]:
+        """
+        Run one no-grad pass over ``loader`` and return average loss and accuracy.
+        Convenience wrapper around ``run_epoch`` for a quick val/test score
+        without going through the full training loop.
+        """
+        loss, acc = self.run_epoch(loader, training=False)
+        return {"loss": loss, "accuracy": acc}
+
+    @torch.no_grad()
+    def predict(self, loader, return_probs: bool = False) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Predict over ``loader``. Returns ``(predictions, labels)`` as numpy arrays,
+        or ``(probabilities, labels)`` when ``return_probs=True`` (softmax over the
+        251 classes). Labels are returned too so the output lines up for metrics.
+        """
+        self.model.eval()
+        preds_or_probs, labels_all = [], []
+        for images, labels in loader:
+            images = images.to(self.device, non_blocking=True)
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                logits = self.model(images)
+            if return_probs:
+                out = torch.softmax(logits.float(), dim=1)
+                preds_or_probs.append(out.cpu().numpy())
+            else:
+                preds_or_probs.append(logits.argmax(1).cpu().numpy())
+            labels_all.append(labels.numpy())
+        return np.concatenate(preds_or_probs), np.concatenate(labels_all)
+
+    #  Checkpoint save / resume 
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        """
+        Save a FULL checkpoint (model + optimizer + scaler + history + counters),
+        so training can be resumed exactly. ``train`` saves only model weights for
+        the best epoch; use this when you want to pause and continue later.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "history": self.history,
+            "best_val_loss": self._best_val_loss,
+            "patience_counter": self._patience_counter,
+        }, path)
+        print(f"Checkpoint saved → {path}")
+
+    def load_checkpoint(self, path: str | Path, weights_only: bool = False) -> None:
+        """
+        Load a checkpoint. With ``weights_only=True`` only the model weights are
+        restored (e.g. to load a best_model.pth for evaluation). Otherwise the
+        optimizer, scaler, history and early-stopping state are restored too, so
+        ``train`` can be called again to resume.
+        """
+        ckpt = torch.load(path, map_location=self.device)
+        if weights_only or "model" not in ckpt:
+            state = ckpt["model"] if "model" in ckpt else ckpt
+            self.model.load_state_dict(state)
+            print(f"Model weights loaded ← {path}")
+            return
+        self.model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.scaler.load_state_dict(ckpt["scaler"])
+        self.history = ckpt.get("history", self.history)
+        self._best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        self._patience_counter = ckpt.get("patience_counter", 0)
+        print(f"Full state restored ← {path} (resume-ready)")
+
+
+
+#  Learning-rate finder 
+
+@torch.no_grad()
+def _set_lr(optimizer, lr: float) -> None:
+    for g in optimizer.param_groups:
+        g["lr"] = lr
+
+
+def lr_finder(
+    model: nn.Module,
+    train_loader,
+    device: torch.device,
+    criterion: Optional[nn.Module] = None,
+    start_lr: float = 1e-6,
+    end_lr: float = 1.0,
+    num_iters: int = 100,
+    weight_decay: float = 1e-4,
+) -> tuple[list[float], list[float]]:
+    """
+    Leslie Smith style LR range test. Trains for ``num_iters`` mini-batches while
+    exponentially increasing the learning rate from ``start_lr`` to ``end_lr``,
+    recording the loss at each step. Plot loss vs lr (log scale) and pick a
+    learning rate roughly one order of magnitude below where the loss is steepest
+    / just before it explodes — a fast, principled alternative to grid-searching
+    the LR when you are not running a full hyperparameter sweep.
+
+    Returns ``(lrs, losses)``. Does NOT mutate the passed model's final weights in
+    a meaningful way for training (it runs a short transient), but for safety run
+    it on a fresh model or rebuild afterwards.
+
+    Example:
+        lrs, losses = lr_finder(M.build_model("foodnet"), train_loader, device)
+        import matplotlib.pyplot as plt
+        plt.plot(lrs, losses); plt.xscale("log"); plt.xlabel("lr"); plt.ylabel("loss")
+    """
+    model = model.to(device).train()
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    optimizer = AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
+
+    # Geometric LR schedule across iterations.
+    mult = (end_lr / start_lr) ** (1.0 / max(num_iters - 1, 1))
+    lr = start_lr
+    lrs, losses = [], []
+    best = float("inf")
+    it = 0
+
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    done = False
+    while not done:
+        for images, labels in train_loader:
+            if it >= num_iters:
+                done = True
+                break
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            _set_lr(optimizer, lr)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                with torch.autocast(device_type=device.type, enabled=use_amp):
+                    loss = criterion(model(images), labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+            loss_val = loss.item()
+            lrs.append(lr)
+            losses.append(loss_val)
+            best = min(best, loss_val)
+            # Stop early if the loss diverges badly (4x the best seen).
+            if loss_val > 4 * best:
+                done = True
+                break
+            lr *= mult
+            it += 1
+
+    print(f"[lr_finder] ran {len(lrs)} iters | lr {lrs[0]:.1e} → {lrs[-1]:.1e}")
+    return lrs, losses

@@ -44,8 +44,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from .loss_function import NTXentLoss
-from .utils import get_device
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from loss_function import NTXentLoss
+from utils import get_device
 
 
 

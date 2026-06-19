@@ -39,10 +39,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import sys
+import os
 
-from .model import build_model, BaseModel
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from .utils import get_device
+from model import build_model, BaseModel
+
+from utils import get_device
 
 # Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
 # installed, so the module never hard-depends on it.
@@ -103,7 +107,7 @@ def default_sl_grid() -> dict[str, list]:
     """
     return {
         "model_name": ["foodnet"],            # proposed model (swap in others to compare)
-        "lr":         [3e-4, 1e-3, 3e-3],        # the single most important knob
+        "lr":         [3e-4, 1e-3],        # the single most important knob
         "optimizer":  ["adamw", "sgd"],          # AdamW vs SGD+momentum
         "weight_decay": [1e-4, 5e-4],            # regularisation strength
         "dropout":    [0.2, 0.4],                # head dropout (over-fitting guard)
