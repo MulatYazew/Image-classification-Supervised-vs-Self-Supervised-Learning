@@ -92,11 +92,11 @@ def cap_images_per_class(df: pd.DataFrame, max_per_class: int | None, seed: int 
     """
     if max_per_class is None:
         return df.reset_index(drop=True)
-    capped = (
-        df.groupby("label", group_keys=False)
-          .apply(lambda g: g.sample(n=min(len(g), max_per_class), random_state=seed))
-    )
-    return capped.reset_index(drop=False)
+    capped = pd.concat([
+        g.sample(n=min(len(g), max_per_class), random_state=seed)
+        for _, g in df.groupby("label", group_keys=False)
+    ])
+    return capped.reset_index(drop=True)
 
 
 def stratified_split(

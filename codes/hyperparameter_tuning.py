@@ -106,13 +106,13 @@ def default_sl_grid() -> dict[str, list]:
     lets the search trade accuracy against the param budget directly.
     """
     return {
-        "model_name": ["foodnet"],            # proposed model (swap in others to compare)
-        "lr":         [3e-4, 1e-3],        # the single most important knob
-        "optimizer":  ["adamw", "sgd"],          # AdamW vs SGD+momentum
-        "weight_decay": [1e-4, 5e-4],            # regularisation strength
-        "dropout":    [0.2, 0.4],                # head dropout (over-fitting guard)
-        "width_mult": [1.0],                     # 1.0 ≈ 8.5 M; lower to shrink
-        "label_smoothing": [0.0, 0.1],           # helps with 251 fine-grained classes
+        "model_name":      ["foodnet_v2"],        # redesigned MBConv model (proposed)
+        "lr":              [3e-4, 1e-3],          # the single most important knob
+        "optimizer":       ["adamw", "sgd"],       # AdamW vs SGD+momentum
+        "weight_decay":    [1e-4, 5e-4],          # regularisation strength
+        "dropout":         [0.2, 0.3],            # head dropout (over-fitting guard)
+        "width_mult":      [1.0],                 # 1.0 = 7.6 M; lower to shrink
+        "label_smoothing": [0.0, 0.1],            # helps with 251 fine-grained classes
     }
 
 
@@ -130,13 +130,13 @@ def default_ssl_grid() -> dict[str, list]:
     selects the downstream traditional read-out and is tuned too.
     """
     return {
-        "model_name":  ["foodnet"],
-        "lr":          [5e-4, 1e-3],
-        "temperature": [0.1, 0.5],               # NT-Xent sharpness (SimCLR only; lower = harder)
-        "weight_decay": [1e-4],
+        "model_name":     ["foodnet_v2"],
+        "lr":             [5e-4, 1e-3],
+        "temperature":    [0.1, 0.5],            # NT-Xent sharpness (SimCLR only)
+        "weight_decay":   [1e-4],
         "projection_dim": [128],
-        "classifier":  ["logreg", "linear_svm", "knn"],        # downstream read-out (tuned)
-        "width_mult":  [1.0, 0.75],
+        "classifier":     ["logreg", "linear_svm", "knn"],
+        "width_mult":     [1.0, 0.75],
     }
 
 

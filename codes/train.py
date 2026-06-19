@@ -23,7 +23,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 
 # Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
 # trainer never hard-depends on it.
@@ -119,14 +123,20 @@ class Trainer:
         self,
         train_loader,
         val_loader,
-        num_epochs: int = 60,
-        patience: int = 8,
+        num_epochs: int = 100,
+        patience: int = 15,
         model_save_dir: str = "models",
         run_name: str = "supervised",
         warmup_frozen_epochs: int = 0,
+        lr_warmup_epochs: int = 5,
     ) -> dict[str, list[float]]:
         """
-        Train with cosine LR annealing and early stopping.
+        Train with linear LR warmup → cosine annealing, and early stopping.
+
+        ``lr_warmup_epochs`` ramps the LR from 0.1× up to the initial value
+        over the first N epochs, then cosine-decays for the remainder. This is
+        critical for stable from-scratch training: cold-starting at full LR
+        causes chaotic early updates that push the model into poor basins.
 
         ``warmup_frozen_epochs`` > 0 trains only the head for that many epochs
         (backbone frozen) before unfreezing — useful when starting from
@@ -134,7 +144,25 @@ class Trainer:
         """
         save_dir = Path(model_save_dir) / run_name
         save_dir.mkdir(parents=True, exist_ok=True)
-        scheduler = CosineAnnealingLR(self.optimizer, T_max=num_epochs, eta_min=1e-6)
+
+        # Build scheduler: linear warm-up → cosine decay.
+        # SequentialLR chains two schedulers at ``milestones=[lr_warmup_epochs]``.
+        warmup_sched = LinearLR(
+            self.optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=max(1, lr_warmup_epochs),
+        )
+        cosine_sched = CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(1, num_epochs - lr_warmup_epochs),
+            eta_min=1e-6,
+        )
+        scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_sched, cosine_sched],
+            milestones=[lr_warmup_epochs],
+        )
 
         # Optional frozen warm-up (e.g. linear-probe phase on SSL weights).
         if warmup_frozen_epochs > 0 and hasattr(self.model, "freeze_backbone"):
