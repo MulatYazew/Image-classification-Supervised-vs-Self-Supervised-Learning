@@ -106,7 +106,7 @@ def default_sl_grid() -> dict[str, list]:
     lets the search trade accuracy against the param budget directly.
     """
     return {
-        "model_name":      ["foodnet_v2"],        # redesigned MBConv model (proposed)
+        "model_name":      ["foodnet46"],          # redesigned MBConv model (proposed)
         "lr":              [3e-4, 1e-3],          # the single most important knob
         "optimizer":       ["adamw", "sgd"],       # AdamW vs SGD+momentum
         "weight_decay":    [1e-4, 5e-4],          # regularisation strength
@@ -130,7 +130,7 @@ def default_ssl_grid() -> dict[str, list]:
     selects the downstream traditional read-out and is tuned too.
     """
     return {
-        "model_name":     ["foodnet_v2"],
+        "model_name":     ["foodnet46"],
         "lr":             [5e-4, 1e-3],
         "temperature":    [0.1, 0.5],            # NT-Xent sharpness (SimCLR only)
         "weight_decay":   [1e-4],

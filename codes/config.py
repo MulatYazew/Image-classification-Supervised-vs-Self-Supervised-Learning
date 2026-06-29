@@ -63,13 +63,13 @@ WEIGHT_DECAY  = 1e-4
 LABEL_SMOOTHING = 0.1      # mild smoothing helps with 251 fine-grained classes
 
 # num_workers > 0 can hang on macOS with some DataLoader configs; keep low.
-NUM_WORKERS = 0
+NUM_WORKERS = 8
 
 #  Custom model 
 # No pretrained backbones are allowed. Choose among the custom architectures
 # defined in model.py — every option is verified < 10 M parameters.
 # Choices: "food251net" (proposed) | "food251net_lite" (baseline)
-MODEL_ARCHITECTURE = "foodnet"
+MODEL_ARCHITECTURE = "foodnet46"
 DROPOUT = 0.3
 WIDTH_MULT = 1.0           # global channel multiplier; lower to shrink the model
 
@@ -104,12 +104,8 @@ SSL_CLASSIFIER      = "logreg"
 
 #  Augmentation 
 AUGMENTATION_INTENSITY = 0.5
-USE_MIXUP    = True
-MIXUP_ALPHA  = 0.2    # Beta(0.2, 0.2) — strong regularisation for 251-class food task
-WARMUP_EPOCHS = 5     # Linear LR ramp before cosine annealing; prevents early BN instability
-AUGMENTATION_INTENSITY = 0.5
-USE_MIXUP    = True
-MIXUP_ALPHA  = 0.2    # Beta(0.2, 0.2) — strong regularisation for 251-class food task
+USE_MIXUP     = True
+MIXUP_ALPHA   = 0.2   # Beta(0.2, 0.2) — strong regularisation for 251-class food task
 WARMUP_EPOCHS = 5     # Linear LR ramp before cosine annealing; prevents early BN instability
 #  Early stopping 
 PATIENCE  = 12             # v2: increased from 8; improved model needs more time to settle

@@ -56,10 +56,10 @@ class GradCAM:
             raise ValueError("No Conv2d layer found in the model.")
         return chosen
 
-    def save_activation(self, module, inp, out) -> None:
+    def _save_activation(self, module, inp, out) -> None:
         self._activations = out.detach()
 
-    def save_gradient(self, module, grad_in, grad_out) -> None:
+    def _save_gradient(self, module, grad_in, grad_out) -> None:
         self._gradients = grad_out[0].detach()
 
     def generate(self, input_tensor: torch.Tensor, class_idx: int | None = None) -> np.ndarray:

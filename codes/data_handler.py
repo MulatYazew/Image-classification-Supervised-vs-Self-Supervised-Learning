@@ -12,8 +12,9 @@ Key spec-driven decisions
     out a per-class fraction so all 251 classes appear in validation.
   * Uncontrolled input size → resize to a common square.
   * RGB kept (food colour is highly discriminative — no greyscale).
-  * Moderate imbalance (100–600 / class)** handled by class weights or a
-    weighted sampler (choose ONE; see loss.py).
+  * Moderate imbalance (100–600 / class) handled by weighted CE / focal loss
+    (see loss_function.py). A single uniform augmentation pipeline is applied
+    across all classes.
   * SSL views SSLPairDataset returns two augmented views per image with
     NO label — exactly what SimCLR-style contrastive pretraining needs.
 """
@@ -159,38 +160,6 @@ def get_transforms(image_size: int = 224, augment: bool = True) -> A.Compose:
     ])
 
 
-def get_robust_transforms(image_size: int = 224) -> A.Compose:
-    """
-    Heavier pipeline for minority food classes (those with ~100 images).
-
-    Extra ops vs the standard pipeline, each motivated for food photography:
-      - VerticalFlip / RandomRotate90 : top-down "flat-lay" food shots have no
-                                        canonical orientation.
-      - GaussianBlur     : phone-camera focus misses / motion blur.
-      - ImageCompression : social-media re-compression artefacts.
-      - CoarseDropout    : partial occlusion (cutlery, hands, garnish).
-    """
-    return A.Compose([
-        A.RandomResizedCrop(size=(image_size, image_size), scale=(0.5, 1.0), p=1.0),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.3),
-        A.RandomRotate90(p=0.4),
-        A.Rotate(limit=12, border_mode=0, p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
-        A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08, p=0.6),
-        A.Affine(translate_percent=0.08, scale=(0.85, 1.15), rotate=(-15, 15), p=0.5),
-        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-        A.ImageCompression(quality_range=(60, 95), p=0.3),
-        A.CoarseDropout(
-            num_holes_range=(4, 8),
-            hole_height_range=(16, 32),
-            hole_width_range=(16, 32),
-            p=0.3,
-        ),
-        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ToTensorV2(),
-    ])
-
 
 def get_ssl_transforms(image_size: int = 224) -> A.Compose:
     """
@@ -225,16 +194,14 @@ class FoodDataset(Dataset):
     """
     Supervised Food-251 dataset.
 
-    Minority classes (passed via ``minority_classes``) get the heavy
-    augmentation pipeline during training; everything else uses the standard
-    (or no-augmentation, for validation) pipeline.
+    Class imbalance is handled via weighted CE / focal loss (see loss_function.py),
+    so a single augmentation pipeline is applied uniformly across all classes.
 
     Args:
-        dataframe        : columns 'image_id' and 'label'.
-        images_dir       : directory of raw images.
-        augment          : apply training augmentations when True.
-        image_size       : common resize target (uncontrolled inputs → square).
-        minority_classes : labels routed to the robust pipeline.
+        dataframe  : columns 'image_id' and 'label'.
+        images_dir : directory of raw images.
+        augment    : apply training augmentations when True.
+        image_size : common resize target (uncontrolled inputs → square).
     """
 
     def __init__(
@@ -243,27 +210,19 @@ class FoodDataset(Dataset):
         images_dir: str | Path,
         augment: bool = True,
         image_size: int = 224,
-        minority_classes: list[int] | set[int] | None = None,
     ) -> None:
         self.df = dataframe.reset_index(drop=True)
         self.images_dir = Path(images_dir)
-        self.augment = augment
-        self.minority_classes = set(minority_classes) if minority_classes else set()
-
-        self.robust_tf = get_robust_transforms(image_size)
-        self.standard_tf = get_transforms(image_size, augment=augment)
+        self.tf = get_transforms(image_size, augment=augment)
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         row = self.df.iloc[idx]
-        label = int(row["label"])
         image = read_rgb(self.images_dir / row["image_id"])
-
-        tf = self.robust_tf if (self.augment and label in self.minority_classes) else self.standard_tf
-        image = tf(image=image)["image"]
-        return image, torch.tensor(label, dtype=torch.long)
+        image = self.tf(image=image)["image"]
+        return image, torch.tensor(int(row["label"]), dtype=torch.long)
 
 
 class SSLPairDataset(Dataset):
@@ -359,16 +318,6 @@ def compute_class_weights(dataframe: pd.DataFrame, num_classes: int = 251,
     w = w.clamp(max=clip)            # bound the rarest-class multiplier
     return w
 
-
-def identify_minority_classes(dataframe: pd.DataFrame, quantile: float = 0.25) -> set[int]:
-    """
-    Data-driven minority set: classes whose image count is in the lowest
-    ``quantile`` of the per-class distribution. These are routed to the heavy
-    augmentation pipeline in ``FoodDataset``.
-    """
-    counts = dataframe["label"].value_counts()
-    threshold = counts.quantile(quantile)
-    return set(counts[counts <= threshold].index.astype(int).tolist())
 
 
 def build_weighted_sampler(dataframe: pd.DataFrame, num_classes: int = 251) -> WeightedRandomSampler:

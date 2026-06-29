@@ -8,12 +8,12 @@ Run python -m codes.model to print the live parameter-budget table.
 Two custom CNNs, both sharing the BaseModel interface so the rest of the
 pipeline (train / evaluate / SSL / tuning) is architecture-agnostic:
 
-  ┌──────────────────┬───────────┬──────────────────────────────────────────────┐
-  │ Model            │ Params*   │ Role                                         │
-  ├──────────────────┼───────────┼──────────────────────────────────────────────┤
-  │ FoodNet          │ < 7.642  M   │ PROPOSED model — residual DWS + SE           │
-  │ FoodNetLite      │ ~0.45 M   │ Lightweight baseline for comparison/ablation │
-  └──────────────────┴───────────┴──────────────────────────────────────────────┘
+  ┌──────────────────┬──────────┬───────────┬──────────────────────────────────┐
+  │ Model            │ Params*  │ Conv2d    │ Role                             │
+  ├──────────────────┼──────────┼───────────┼──────────────────────────────────┤
+  │ FoodNet30        │ ~7.6 M   │ 30        │ Residual DWS + SE backbone       │
+  │ FoodNet46        │ ~4.4 M   │ 46        │ PROPOSED — MBConv + SE + DropPath│
+  └──────────────────┴──────────┴───────────┴──────────────────────────────────┘
   * measured at width_mult=1.0, num_classes=251, 224x224 input (see __main__).
 
 What changed in this corrected version (and WHY it matters for accuracy)
@@ -381,29 +381,27 @@ class MBConvBlock(nn.Module):
         return out
 
 
-#  FoodNet  (original — residual depthwise-separable + SE, kept for reference)
+#  FoodNet30  (residual depthwise-separable + SE, 30 Conv2d layers)
 
-class FoodNet(BaseModel):
+class FoodNet30(BaseModel):
     """
-    Proposed custom CNN: a residual depthwise-separable network with SE
-    attention, built from scratch and kept under the 10 M budget.
+    Custom CNN with 30 convolutional layers: a residual depthwise-separable
+    network with SE attention, built from scratch and kept under the 10 M budget.
 
-    Stage layout (channels scale with "width_mult" ; SE on every DWS block;
+    Stage layout (channels scale with "width_mult"; SE on every DWS block;
     identity residuals on the same-channel within-stage blocks)::
 
-        Stem:   Conv3x3 s2 (3→32) → Conv3x3 (32→64)        224 → 112
-        Stage1: DWS (64→128) + DWS-res          + pool      112 → 56
-        Stage2: DWS (128→256) + DWS-res         + pool      56  → 28
-        Stage3: DWS (256→512) + DWS-res ×4      + pool       28  → 14
-        Stage4: DWS (512→1024) + DWS-res ×4     + pool       14  → 7
+        Stem:   Conv3x3 s2 (3→32) → Conv3x3 (32→64)        224 → 112   [2 conv]
+        Stage1: DWS (64→128) + DWS-res          + pool      112 → 56    [4 conv]
+        Stage2: DWS (128→256) + DWS-res         + pool      56  → 28    [4 conv]
+        Stage3: DWS (256→512) + DWS-res ×4      + pool       28  → 14   [10 conv]
+        Stage4: DWS (512→1024) + DWS-res ×4     + pool       14  → 7    [10 conv]
         Head:   GAP → (B, 1024) → make_head → 251 logits
 
-    The deep stage-3/4 stacks concentrate capacity at the semantically rich,
-    low-resolution end of the network, and the identity residuals there give the
-    gradient a clean path so those blocks actually contribute. feature_dim=1024.
+    Total: 30 Conv2d layers. feature_dim=1024.
     """
 
-    NAME = "foodnet"
+    NAME = "foodnet30"
 
     def build(self) -> None:
         w = self.width_mult
@@ -450,110 +448,60 @@ class FoodNet(BaseModel):
         return self.flatten(x)                 # (B, feat)
 
 
-#  FoodNetLite  (lightweight baseline, ~0.45 M) 
 
-class FoodNetLite(BaseModel):
+#  FoodNet46  (PROPOSED — MBConv inverted-residual + SE + DropPath, 46 Conv2d layers)
+
+class FoodNet46(BaseModel):
     """
-    Lightweight baseline (~0.45 M params). Shallower, narrower depthwise-separable
-    network. Trains fast — ideal as the ablation lower bound and for quick
-    hyper-parameter sweeps before committing to the full Food251Net.
-    """
+    Custom CNN with 46 convolutional layers: MBConv inverted-residual blocks
+    with SE attention and DropPath stochastic depth, tuned for Apple Silicon.
 
-    NAME = "foodnet_lite"
+    Each MBConv block follows: Expand-1×1 → DW-3×3 → SE → Project-1×1.
+    The expansion step gives the depthwise conv more channels to mix,
+    producing richer features without a proportional parameter cost (the
+    "inverted bottleneck" is why MobileNetV2/V3 outperform V1).
 
-    def build(self) -> None:
-        w = self.width_mult
-
-        def c(ch: int) -> int:
-            return max(8, int(round(ch * w)))
-
-        stem_out = c(32)
-        self.backbone = nn.Sequential(
-            conv_batchnorm_activation(3, c(16), k=3, s=2),         # 224 → 112
-            conv_batchnorm_activation(c(16), stem_out, k=3, s=1),
-
-            DepthwiseSeparable(stem_out, c(64)),     # 112
-            nn.MaxPool2d(2),                         # 112 → 56
-
-            DepthwiseSeparable(c(64), c(128)),       # 56
-            nn.MaxPool2d(2),                         # 56 → 28
-
-            DepthwiseSeparable(c(128), c(256)),      # 28 (channel change)
-            DepthwiseSeparable(c(256), c(256)),      #    (residual)
-            nn.MaxPool2d(2),                         # 28 → 14
-
-            DepthwiseSeparable(c(256), c(256), final_act=False),  # 14, two-sided (residual)
-            nn.MaxPool2d(2),                         # 14 → 7
-        )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.flatten = nn.Flatten()
-        self.feature_dim = c(256)
-        self.head = make_head(self.feature_dim, self.num_classes, self.dropout)
-
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(x)
-        x = self.pool(x)
-        return self.flatten(x)
-
-
-#  FoodNetV2  (PROPOSED — MBConv inverted-residual + SE + DropPath)
-
-class FoodNetV2(BaseModel):
-    """
-    FoodNetV2 — the redesigned custom CNN for Food recognition.
-
-    Core improvement over FoodNet: **MBConv (inverted residual)** blocks.
-    Where FoodNet used plain depthwise-separable (DW → PW), FoodNetV2 uses:
-
-        Expand-1×1 → DW-3×3 → SE → Project-1×1
-
-    The expansion step gives the depthwise conv *more channels* to mix,
-    producing richer features without a proportional parameter cost. This
-    "inverted bottleneck" is the key reason MobileNetV2/V3 outperform V1.
-
-    Additional improvements over FoodNet:
+    Additional design choices:
       * Hard-Swish activation (replaces ReLU — measurably better on vision).
-      * DropPath stochastic depth (regularises a deep 18-block stack without
-        over-penalising the rarest classes the way global Dropout would).
-      * EfficientNet-style SE: ``se_hidden = in_ch // 4`` (tied to pre-expansion
+      * DropPath stochastic depth (linearly-increasing schedule 0 → 0.2).
+      * EfficientNet-style SE: se_hidden = in_ch // 4 (tied to pre-expansion
         input channels, not the expanded width) — better accuracy per parameter.
-      * Progressive feature widths finishing at 192 channels, then a 1×1 neck
-        conv expands to ``feature_dim=768`` — larger embedding for 251 classes.
+
+    Reduced from 73 layers by trimming block counts in stages 3–7 (24 → 15
+    MBConv blocks total) and lowering the neck embedding from 960 → 768.
+    This cuts ~35% of the forward-pass cost while retaining the MBConv
+    inverted-bottleneck design and full 7-stage spatial hierarchy.
 
     Stage layout (channels scale with width_mult)::
 
-        Stem:    Conv3×3/s=2, 3→32, BN, H-Swish          224 → 112
-        Stage 1: MBConv(t=1, 32→24,   n=1, s=1, SE)          112
-        Stage 2: MBConv(t=4, 24→40,   n=2, s=2, SE)          56
-        Stage 3: MBConv(t=4, 40→80,   n=3, s=2, SE)          28
-        Stage 4: MBConv(t=4, 80→112,  n=3, s=2, SE)          14
-        Stage 5: MBConv(t=6, 112→112, n=3, s=1, SE)          14
-        Stage 6: MBConv(t=6, 112→192, n=4, s=2, SE)           7
-        Stage 7: MBConv(t=6, 192→192, n=2, s=1, SE)           7
-        Neck:    Conv1×1, →768, BN, H-Swish                    7
+        Stem:    Conv3×3/s=2, 3→32, BN, H-Swish          224→112  [ 1 conv]
+        Stage 1: MBConv(t=1, 32→24,   n=1, s=1, SE)          112  [ 2 conv]
+        Stage 2: MBConv(t=4, 24→40,   n=2, s=2, SE)           56  [ 6 conv]
+        Stage 3: MBConv(t=4, 40→80,   n=2, s=2, SE)           28  [ 6 conv]
+        Stage 4: MBConv(t=4, 80→112,  n=3, s=2, SE)           14  [ 9 conv]
+        Stage 5: MBConv(t=6, 112→112, n=2, s=1, SE)           14  [ 6 conv]
+        Stage 6: MBConv(t=6, 112→192, n=3, s=2, SE)            7  [ 9 conv]
+        Stage 7: MBConv(t=6, 192→192, n=2, s=1, SE)            7  [ 6 conv]
+        Neck:    Conv1×1, →768, BN, H-Swish                     7  [ 1 conv]
         Head:    GAP → head → 251 logits
 
-    feature_dim = 768 (good capacity for 251 fine-grained food categories).
-    Total parameters ≈ 7.2 M at width_mult=1.0 — under the 10 M cap.
+    Total: 46 Conv2d layers. feature_dim=768. ~4.4 M params at width_mult=1.0.
     """
 
-    NAME = "foodnet_v2"
+    NAME = "foodnet46"
 
     # (expand_ratio, out_channels, num_blocks, stride)
-    # Later stages (6-7, operating at 7×7) are deliberately deep: semantic
-    # discrimination between 251 food categories happens at low resolution,
-    # so packing most capacity there is the right trade-off.
     STAGES = [
         (1,  24, 1, 1),
         (4,  40, 2, 2),
-        (4,  80, 3, 2),
-        (4, 112, 4, 2),   # 4 blocks at 14×14
-        (6, 112, 4, 1),   # 4 blocks at 14×14
-        (6, 192, 6, 2),   # 6 blocks at  7×7  ← most capacity here
-        (6, 192, 4, 1),   # 4 blocks at  7×7
+        (4,  80, 2, 2),   # 2 blocks at 28×28  (was 3)
+        (4, 112, 3, 2),   # 3 blocks at 14×14  (was 4)
+        (6, 112, 2, 1),   # 2 blocks at 14×14  (was 4)
+        (6, 192, 3, 2),   # 3 blocks at  7×7   (was 6)
+        (6, 192, 2, 1),   # 2 blocks at  7×7   (was 4)
     ]
-    NECK_CH   = 960      # larger neck embedding for 251 fine-grained classes
-    MAX_DROP_PATH = 0.2  # stronger stochastic depth for the deeper network
+    NECK_CH       = 768   # reduced from 960; still sufficient for 251 classes
+    MAX_DROP_PATH = 0.2
 
     def build(self) -> None:
         w = self.width_mult
@@ -614,9 +562,8 @@ class FoodNetV2(BaseModel):
 #  Registry & factory
 
 MODEL_REGISTRY: dict[str, type[BaseModel]] = {
-    "foodnet":      FoodNet,
-    "foodnet_lite": FoodNetLite,
-    "foodnet_v2":   FoodNetV2,
+    "foodnet30": FoodNet30,
+    "foodnet46": FoodNet46,
 }
 
 
@@ -645,12 +592,12 @@ def build_model(name: str, num_classes: int = 251, dropout: float = 0.3,
 
 
 def create_model(num_classes: int = 251, pretrained: bool = False,
-                 model_name: str = "foodnet_v2") -> BaseModel:
+                 model_name: str = "foodnet46") -> BaseModel:
     """
     Legacy alias kept for compatibility with older scripts.
 
     ``pretrained`` is ignored — the exam forbids pretrained weights.
-    Default updated to ``foodnet_v2`` (the redesigned MBConv model).
+    Default is ``foodnet46`` (46-layer MBConv model).
     """
     if pretrained:
         import warnings
