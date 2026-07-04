@@ -129,9 +129,16 @@ def stratified_split(
 
 #  Augmentation pipelines 
 
-def get_transforms(image_size: int = 224, augment: bool = True) -> A.Compose:
+def get_transforms(image_size: int = 224, augment: bool = True, intensity: float = 0.5) -> A.Compose:
     """
     Standard pipeline for majority classes (training) and val/inference.
+
+    ``intensity`` in [0, 1] scales every magnitude/probability below via
+    ``scale = intensity / 0.5``, so ``intensity=0.5`` reproduces the original
+    hand-tuned pipeline exactly, ``intensity=0`` degrades towards a near
+    identity transform, and ``intensity=1`` is a visibly more aggressive
+    policy. This lets a single config value (``config.AUGMENTATION_INTENSITY``)
+    drive the report's augmentation-ablation runs.
 
     Food-specific choices:
       - RandomResizedCrop  : plates are shot at varying distances / framings.
@@ -139,22 +146,52 @@ def get_transforms(image_size: int = 224, augment: bool = True) -> A.Compose:
       - Rotate (±20°)      : casual phone photos are rarely perfectly level.
       - BrightnessContrast : restaurant vs daylight vs flash lighting varies.
       - ColorJitter (mild) : white-balance differs across cameras — but hue is
-                             kept small because colour is a strong food cue.
+                             capped tight (even at intensity=1) because colour
+                             is a strong food cue (e.g. garlic bread vs.
+                             focaccia); a wide hue jitter could turn a tomato
+                             blue. Grayscale is deliberately NOT used here for
+                             the same reason (unlike the SSL pipeline below,
+                             which can afford to destroy colour because it
+                             only needs structural invariance).
+      - CoarseDropout      : simulates garnish, utensils, or a hand partially
+                             covering the dish.
+      - RandomShadow       : simulates uneven restaurant/daylight lighting.
       - Normalize          : ImageNet stats centre the RGB inputs.
     """
-    if augment:
+    if not augment:
         return A.Compose([
-            A.RandomResizedCrop(size=(image_size, image_size), scale=(0.7, 1.0), p=1.0),
-            A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=15, border_mode=0, p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.3),
-            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1, hue=0.03, p=0.3),
-            A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-10, 10), p=0.4),
+            A.Resize(image_size, image_size),
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ToTensorV2(),
         ])
+
+    scale = float(np.clip(intensity, 0.0, 1.0)) / 0.5   # 1.0 at the default intensity=0.5
+    p = lambda base: float(np.clip(base * scale, 0.0, 1.0))          # noqa: E731
+    crop_lo = float(np.clip(1.0 - 0.3 * scale, 0.3, 1.0))
+    rotate_limit = max(1, int(round(15 * scale)))
+    affine_rotate = 10 * scale
+    affine_translate = float(np.clip(0.05 * scale, 0.0, 0.3))
+    affine_scale = float(np.clip(0.1 * scale, 0.0, 0.4))
+    hue_jitter = min(0.06, 0.03 * scale)                             # tightly capped regardless of scale
+    n_holes = max(1, int(round(2 * scale)))
+    hole_frac = float(np.clip(0.10 * scale, 0.03, 0.25))
+
     return A.Compose([
-        A.Resize(image_size, image_size),
+        A.RandomResizedCrop(size=(image_size, image_size), scale=(crop_lo, 1.0), p=1.0),
+        A.HorizontalFlip(p=0.5),
+        A.Rotate(limit=rotate_limit, border_mode=0, p=p(0.5)),
+        A.RandomBrightnessContrast(brightness_limit=0.15 * scale, contrast_limit=0.15 * scale, p=p(0.3)),
+        A.ColorJitter(brightness=0.15 * scale, contrast=0.15 * scale, saturation=0.1 * scale,
+                     hue=hue_jitter, p=p(0.3)),
+        A.Affine(translate_percent=affine_translate,
+                 scale=(1.0 - affine_scale, 1.0 + affine_scale),
+                 rotate=(-affine_rotate, affine_rotate), p=p(0.4)),
+        A.CoarseDropout(num_holes_range=(1, n_holes),
+                        hole_height_range=(0.03, hole_frac),
+                        hole_width_range=(0.03, hole_frac),
+                        fill=0, p=p(0.25)),
+        A.RandomShadow(shadow_roi=(0, 0.4, 1, 1), num_shadows_limit=(1, 2),
+                       shadow_intensity_range=(0.3, 0.6), p=p(0.2)),
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
     ])
@@ -194,14 +231,25 @@ class FoodDataset(Dataset):
     """
     Supervised Food-251 dataset.
 
-    Class imbalance is handled via weighted CE / focal loss (see loss_function.py),
-    so a single augmentation pipeline is applied uniformly across all classes.
+    Class imbalance is primarily handled via weighted CE / focal loss (see
+    loss_function.py). Optionally, a SECOND, complementary correction can be
+    enabled here: classes in ``tail_classes`` are augmented at a higher
+    ``intensity`` (``intensity * tail_boost``) so the data-poor classes see
+    more diverse synthetic variation per epoch. This is independent of the
+    loss-weight / sampler correction (which reweights gradients, not pixels),
+    so it is safe to combine with either — unlike sampler-vs-loss-weights,
+    there is no double-correction risk here.
 
     Args:
-        dataframe  : columns 'image_id' and 'label'.
-        images_dir : directory of raw images.
-        augment    : apply training augmentations when True.
-        image_size : common resize target (uncontrolled inputs → square).
+        dataframe    : columns 'image_id' and 'label'.
+        images_dir   : directory of raw images.
+        augment      : apply training augmentations when True.
+        image_size   : common resize target (uncontrolled inputs → square).
+        intensity    : base augmentation intensity (config.AUGMENTATION_INTENSITY).
+        tail_classes : optional set of class ids to augment more aggressively
+                       (see ``compute_tail_classes``); None/empty = uniform
+                       augmentation across all classes (original behaviour).
+        tail_boost   : multiplier applied to ``intensity`` for tail classes.
     """
 
     def __init__(
@@ -210,10 +258,20 @@ class FoodDataset(Dataset):
         images_dir: str | Path,
         augment: bool = True,
         image_size: int = 224,
+        intensity: float = 0.5,
+        tail_classes: set[int] | None = None,
+        tail_boost: float = 1.4,
     ) -> None:
         self.df = dataframe.reset_index(drop=True)
         self.images_dir = Path(images_dir)
-        self.tf = get_transforms(image_size, augment=augment)
+        self.tail_classes = tail_classes or set()
+        self.tf = get_transforms(image_size, augment=augment, intensity=intensity)
+        # Only build a second pipeline when tail-aware augmentation is actually
+        # requested; otherwise every sample uses the single uniform pipeline.
+        self.tf_tail = (
+            get_transforms(image_size, augment=augment, intensity=min(1.0, intensity * tail_boost))
+            if augment and self.tail_classes else self.tf
+        )
 
     def __len__(self) -> int:
         return len(self.df)
@@ -221,7 +279,8 @@ class FoodDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         row = self.df.iloc[idx]
         image = read_rgb(self.images_dir / row["image_id"])
-        image = self.tf(image=image)["image"]
+        tf = self.tf_tail if int(row["label"]) in self.tail_classes else self.tf
+        image = tf(image=image)["image"]
         return image, torch.tensor(int(row["label"]), dtype=torch.long)
 
 
@@ -272,7 +331,44 @@ class FeatureExtractionDataset(Dataset):
         return image, torch.tensor(int(row["label"]), dtype=torch.long)
 
 
-#  Class-weight / sampler / minority helpers 
+#  Class-weight / sampler / minority helpers
+
+def compute_tail_classes(dataframe: pd.DataFrame, num_classes: int = 251,
+                         tail_frac: float = 0.2) -> set[int]:
+    """
+    Return the class ids in the smallest ``tail_frac`` fraction of the
+    per-class image-count distribution (e.g. the ~34-image classes).
+
+    Two consumers share this single definition of "tail class" so the report
+    stays internally consistent:
+      * ``FoodDataset`` (tail-aware augmentation boost, see above), and
+      * ``evaluate.py`` (head-vs-tail metric breakdown), via
+        ``config.TAIL_CLASS_FRACTION``.
+    """
+    counts = dataframe["label"].value_counts().reindex(range(num_classes), fill_value=0)
+    n_tail = max(1, int(round(num_classes * tail_frac)))
+    return set(counts.sort_values(kind="mergesort").index[:n_tail].tolist())
+
+
+def check_single_imbalance_correction(use_weighted_sampler: bool,
+                                      class_weights: torch.Tensor | None) -> None:
+    """
+    Raise if BOTH a weighted sampler and non-None loss class-weights are
+    active at once. Stacking the two over-corrects the same imbalance twice
+    (oversampling rare classes AND up-weighting their loss), which can
+    destabilise training on the rarest ~34-image classes. Call this once
+    after building the sampler/criterion for a run — cheap, and turns the
+    "pick exactly one" convention documented on ``compute_class_weights`` /
+    ``build_weighted_sampler`` into an enforced invariant rather than a
+    comment that can silently rot.
+    """
+    if use_weighted_sampler and class_weights is not None:
+        raise ValueError(
+            "Both a WeightedRandomSampler and non-None class_weights are active — "
+            "pick exactly one imbalance-correction path (config.USE_WEIGHTED_SAMPLER "
+            "XOR config.CLASS_WEIGHT_SCHEME), not both."
+        )
+
 
 def compute_class_weights(dataframe: pd.DataFrame, num_classes: int = 251,
                           scheme: str = "sqrt_inv", beta: float = 0.999,

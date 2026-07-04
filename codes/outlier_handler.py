@@ -1089,6 +1089,107 @@ def apply_review_decisions(df: pd.DataFrame, remove_csv_paths: List[str], output
     return final_df
 
 
+# Per-Class Audit Summary Report
+
+# Ties the 3 stages together into one per-class trail: how many images each
+# class started with, how many were auto-removed at Stage 1, how many are
+# flagged (not yet removed) at Stages 2/3, and — once reviewer decisions are
+# applied — the final surviving count. This is what confirms the audit did
+# not gut any of the ~34-image tail classes below a usable minimum, and it
+# is the CSV the report's "Data Preprocessing" section can cite directly.
+
+
+def audit_summary_report(
+    raw_df: pd.DataFrame,
+    stage1_df: pd.DataFrame,
+    flagged2_df: pd.DataFrame,
+    flagged3_df: pd.DataFrame,
+    final_df: Optional[pd.DataFrame] = None,
+    num_classes: int = 251,
+    out_dir: str = ".",
+    min_remaining: int = 15,
+) -> pd.DataFrame:
+    """Build and save the per-class outlier-audit trail across all 3 stages.
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame
+        The original, unfiltered manifest (before Stage 1).
+    stage1_df : pd.DataFrame
+        Manifest after Stage 1 auto-removal (``image_integrity_audit`` output).
+    flagged2_df, flagged3_df : pd.DataFrame
+        Stage 2 / Stage 3 flagged-for-review subsets (NOT yet removed).
+    final_df : pd.DataFrame or None
+        The reviewer-confirmed final manifest (``apply_review_decisions``
+        output / ``train_labels_clean.csv``), if review has been completed.
+        When omitted, a WORST-CASE final count is estimated by assuming every
+        flagged image (Stage 2 or Stage 3, whichever flags more per class) is
+        eventually removed — a conservative lower bound to sanity-check
+        BEFORE committing to manual review decisions.
+    num_classes : int
+        Total number of classes (251, fixed by the spec).
+    out_dir : str
+        Directory the summary CSV is written to.
+    min_remaining : int
+        Classes at or below this many surviving images are printed as a
+        warning (default 15 — half the smallest known class size of ~34).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per class with columns ``label``, ``raw_count``,
+        ``stage1_removed``, ``stage1_remaining``, ``stage2_flagged_for_review``,
+        ``stage3_flagged_for_review``, plus either ``final_count`` (if
+        *final_df* given) or ``final_count_worst_case``, and
+        ``pct_of_raw_remaining``.
+    """
+    idx = range(num_classes)
+    raw_counts = raw_df["label"].value_counts().reindex(idx, fill_value=0)
+    stage1_counts = stage1_df["label"].value_counts().reindex(idx, fill_value=0)
+    stage2_flags = (flagged2_df["label"].value_counts().reindex(idx, fill_value=0)
+                    if flagged2_df is not None and not flagged2_df.empty
+                    else pd.Series(0, index=idx))
+    stage3_flags = (flagged3_df["label"].value_counts().reindex(idx, fill_value=0)
+                    if flagged3_df is not None and not flagged3_df.empty
+                    else pd.Series(0, index=idx))
+
+    report = pd.DataFrame({
+        "label": list(idx),
+        "raw_count": raw_counts.values,
+        "stage1_removed": (raw_counts - stage1_counts).values,
+        "stage1_remaining": stage1_counts.values,
+        "stage2_flagged_for_review": stage2_flags.values,
+        "stage3_flagged_for_review": stage3_flags.values,
+    })
+
+    if final_df is not None:
+        final_counts = final_df["label"].value_counts().reindex(idx, fill_value=0)
+        report["final_count"] = final_counts.values
+        count_col = "final_count"
+    else:
+        # Worst case: assume every flagged image is eventually confirmed removed.
+        max_flagged = np.maximum(stage2_flags.values, stage3_flags.values)
+        report["final_count_worst_case"] = np.clip(stage1_counts.values - max_flagged, 0, None)
+        count_col = "final_count_worst_case"
+
+    report["pct_of_raw_remaining"] = (
+        report[count_col] / report["raw_count"].replace(0, np.nan) * 100
+    ).round(1)
+
+    gutted = report[report[count_col] < min_remaining].sort_values(count_col)
+    tag = " (worst-case estimate — review not yet applied)" if count_col.endswith("worst_case") else ""
+    print(f"\n[audit_summary_report] {len(gutted)} / {num_classes} classes below "
+          f"{min_remaining} images after cleaning{tag}")
+    if not gutted.empty:
+        print(gutted[["label", "raw_count", count_col, "pct_of_raw_remaining"]].to_string(index=False))
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "outlier_summary_by_class.csv")
+    report.to_csv(path, index=False)
+    print(f"  -> saved: {path}")
+    return report
+
+
 
 # Master Pipeline
 

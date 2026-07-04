@@ -277,6 +277,14 @@ def fit_traditional_classifier(
         A fitted scikit-learn ``Pipeline`` (StandardScaler → estimator) exposing
         ``.predict``. Standardising first markedly speeds up and stabilises the
         linear solvers on 251-class, high-dimensional features.
+
+    Class imbalance: the SSL pretext task itself needs no correction (NT-Xent
+    ignores labels), but this READ-OUT classifier is fit on labels and inherits
+    the same ~19:1 imbalance as the supervised task, so it gets the same
+    ``class_weight="balanced"`` treatment for the estimators that support it
+    (logreg, linear_svm). KNN has no ``class_weight`` parameter — its closest
+    lever is ``weights="distance"`` (already set below), which at least avoids
+    letting a dense majority-class neighbourhood dominate a tied vote.
     """
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
@@ -289,10 +297,11 @@ def fit_traditional_classifier(
         from sklearn.linear_model import LogisticRegression
         clf = LogisticRegression(
             solver="saga", max_iter=200, C=1.0, n_jobs=-1, random_state=seed,
+            class_weight="balanced",
         )
     elif classifier == "linear_svm":
         from sklearn.svm import LinearSVC
-        clf = LinearSVC(C=1.0, max_iter=5000, random_state=seed)
+        clf = LinearSVC(C=1.0, max_iter=5000, random_state=seed, class_weight="balanced")
     elif classifier == "knn":
         from sklearn.neighbors import KNeighborsClassifier
         clf = KNeighborsClassifier(n_neighbors=20, weights="distance", n_jobs=-1)

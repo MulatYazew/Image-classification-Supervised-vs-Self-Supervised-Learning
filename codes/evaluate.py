@@ -77,6 +77,61 @@ class Evaluator:
     def compute_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         return self.metrics_from_predictions(y_true, y_pred)
 
+    def per_class_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> pd.DataFrame:
+        """
+        Per-class precision/recall/F1/support — NOT just the macro average.
+
+        With ~19:1 class imbalance, macro-F1 can look acceptable while the
+        smallest (~34-image) classes sit at zero recall; this table is what
+        actually shows whether those tail classes are improving across a
+        training run, rather than the head classes inflating the average.
+        """
+        labels = np.arange(self.num_classes)
+        precision = precision_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
+        recall = recall_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
+        f1 = f1_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
+        support = pd.Series(y_true).value_counts().reindex(labels, fill_value=0).to_numpy()
+        return pd.DataFrame({
+            "label": labels,
+            "class_name": [self.class_names[i] for i in labels],
+            "support": support,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        })
+
+    @staticmethod
+    def head_vs_tail_summary(per_class_df: pd.DataFrame, tail_classes: set[int] | None = None,
+                             tail_frac: float = 0.2) -> dict:
+        """
+        Split the per-class table into head/tail groups and report mean
+        recall/F1 for each — the single number that tells you whether an
+        imbalance fix (re-weighting, tail-aware augmentation, oversampling)
+        is actually helping the data-poor classes rather than just the
+        macro average moving because the head classes got better.
+
+        ``tail_classes`` should be ``data_handler.compute_tail_classes(...)``
+        so the definition of "tail" matches the one used for augmentation;
+        if omitted, the smallest ``tail_frac`` of classes BY SUPPORT in this
+        table are used instead (only valid when the table covers a
+        representative validation split).
+        """
+        if tail_classes is None:
+            n_tail = max(1, int(round(len(per_class_df) * tail_frac)))
+            tail_classes = set(
+                per_class_df.sort_values("support", kind="mergesort")["label"].head(n_tail)
+            )
+        is_tail = per_class_df["label"].isin(tail_classes)
+        tail_df, head_df = per_class_df[is_tail], per_class_df[~is_tail]
+        return {
+            "n_tail_classes": int(is_tail.sum()),
+            "n_head_classes": int((~is_tail).sum()),
+            "tail_recall_mean": float(tail_df["recall"].mean()) if len(tail_df) else float("nan"),
+            "tail_f1_mean": float(tail_df["f1"].mean()) if len(tail_df) else float("nan"),
+            "head_recall_mean": float(head_df["recall"].mean()) if len(head_df) else float("nan"),
+            "head_f1_mean": float(head_df["f1"].mean()) if len(head_df) else float("nan"),
+        }
+
     def print_report(self, y_true: np.ndarray, y_pred: np.ndarray, max_classes: int = 30) -> None:
         """Print the sklearn classification report (truncated for 251 classes)."""
         names = self.class_names if self.num_classes <= max_classes else None

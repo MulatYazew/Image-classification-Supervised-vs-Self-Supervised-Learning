@@ -81,11 +81,23 @@ USE_WEIGHTED_SAMPLER = False   # pick ONE correction point (sampler XOR loss wei
 # Per-class weight scheme for compute_class_weights: "inv" | "sqrt_inv" | "effective".
 CLASS_WEIGHT_SCHEME = "sqrt_inv"
 
-#  Hyperparameter tuning 
+#  Hyperparameter tuning
 # Short probe budget per configuration during the search (the winner is then
 # trained to convergence with NUM_EPOCHS / SSL_EPOCHS).
 TUNE_PROBE_EPOCHS     = 5
 SSL_TUNE_PROBE_EPOCHS = 10
+# Search strategy: "grid" (exhaustive), "random" (sample N configs — better
+# than grid once >~2 axes are combined, for the same compute budget), or
+# "successive_halving" (start many configs at a short budget, keep the top
+# half, double their budget, repeat — cheap-search-then-confirm in one loop).
+TUNE_STRATEGY         = "successive_halving"
+TUNE_N_RANDOM_CONFIGS = 20     # sampled configs when TUNE_STRATEGY != "grid"
+# Rank configs by macro-F1, not accuracy: with ~19:1 class imbalance a config
+# can look fine on accuracy at epoch 5 while ignoring the tail classes.
+TUNE_SELECTION_METRIC = "f1_macro"    # "f1_macro" | "accuracy"
+# Optional documented cap on the SEARCH data only (Phase A/B); Phase C's final
+# confirmation run always uses the full dataset regardless of this value.
+TUNE_SUBSET_IMAGES_PER_CLASS = 100
 
 #  Self-Supervised Learning (pretext) 
 # SSL pretrains the SAME custom backbone on the images WITHOUT labels, then we
@@ -102,11 +114,43 @@ SSL_PROJECTION_DIM  = 128       # projection-head output dimension
 # "logreg" (logistic regression) | "linear_svm" | "knn"
 SSL_CLASSIFIER      = "logreg"
 
-#  Augmentation 
+#  Augmentation
+# Scales augmentation magnitude/probability continuously (0=off, 1=aggressive);
+# 0.5 reproduces the original hand-tuned pipeline exactly. Wired into
+# data_handler.get_transforms so a single knob drives the report's
+# augmentation-ablation runs instead of hand-editing the pipeline each time.
 AUGMENTATION_INTENSITY = 0.5
-USE_MIXUP     = True
-MIXUP_ALPHA   = 0.2   # Beta(0.2, 0.2) — strong regularisation for 251-class food task
+# Class-aware augmentation: the smallest TAIL_CLASS_FRACTION of classes (by
+# image count) get AUGMENTATION_INTENSITY * TAIL_AUG_BOOST instead of the
+# uniform intensity, so data-poor classes see more diverse synthetic variation
+# per epoch. Same fraction is reused by evaluate.py to report tail-vs-head
+# metrics separately (see codes.data_handler.compute_tail_classes).
+TAIL_CLASS_FRACTION = 0.2
+TAIL_AUG_BOOST       = 1.4
+USE_TAIL_AWARE_AUGMENTATION = True
+
+# Sample-mixing regulariser applied inside Trainer.run_epoch. CutMix tends to
+# help more than MixUp on fine-grained, texture-heavy classes (e.g. garlic
+# bread vs. focaccia) because it preserves local texture patches instead of
+# globally blending pixel values.
+MIX_METHOD   = "mixup"    # "none" | "mixup" | "cutmix"
+MIXUP_ALPHA  = 0.2        # Beta(0.2, 0.2) — strong regularisation for 251-class food task
+CUTMIX_ALPHA = 1.0        # Beta(1, 1) — uniform box-size sampling, the standard CutMix default
+
 WARMUP_EPOCHS = 5     # Linear LR ramp before cosine annealing; prevents early BN instability
-#  Early stopping 
+
+#  Per-class metric logging
+# Epochs between full per-class val F1 logging during training (0 = only at
+# the very end). Cheap relative to an epoch, but not free at 251 classes, so
+# it is not computed every epoch by default.
+LOG_PER_CLASS_EVERY = 10
+
+#  Outlier-handling report
+# If any class has fewer than this many images left after all 3 audit stages,
+# the summary report (outlier_handler.audit_summary_report) flags it instead
+# of silently accepting a gutted class.
+OUTLIER_MIN_CLASS_REMAINING = 15
+
+#  Early stopping
 PATIENCE  = 12             # v2: increased from 8; improved model needs more time to settle
 MIN_DELTA = 1e-4
