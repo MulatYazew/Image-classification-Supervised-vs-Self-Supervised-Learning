@@ -63,7 +63,7 @@ WEIGHT_DECAY  = 1e-4
 LABEL_SMOOTHING = 0.1      # mild smoothing helps with 251 fine-grained classes
 
 # num_workers > 0 can hang on macOS with some DataLoader configs; keep low.
-NUM_WORKERS = 8
+NUM_WORKERS = 0
 
 #  Custom model 
 # No pretrained backbones are allowed. Choose among the custom architectures
