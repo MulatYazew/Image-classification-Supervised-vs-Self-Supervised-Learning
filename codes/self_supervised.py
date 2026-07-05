@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -50,7 +51,8 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from loss_function import NTXentLoss
-from utils import get_device
+from model import BaseModel
+from utils import get_device, LocalEarlyStopper
 
 
 
@@ -80,9 +82,11 @@ class ProjectionHead(nn.Module):
 
 #  SimCLR contrastive pretraining 
 
-def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs: int = 100,lr: float = 1e-3, 
-                    weight_decay: float = 1e-4,temperature: float = 0.5, projection_dim: int = 128, 
-                    batch_size_ref: int = 256, use_amp: bool = True, save_path: str | Path | None = None,) -> dict[str, list[float]]:
+def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs: int = 100,lr: float = 1e-3,
+                    weight_decay: float = 1e-4,temperature: float = 0.5, projection_dim: int = 128,
+                    batch_size_ref: int = 256, use_amp: bool = True, save_path: str | Path | None = None,
+                    early_stop_patience: int = 0,
+                    eval_fn: Optional[Callable[[], float]] = None) -> dict[str, list[float]]:
     """
     Contrastively pretrain ``backbone.forward_features`` with NT-Xent.
 
@@ -97,6 +101,17 @@ def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs
                         number of negatives (≈ batch size).
         batch_size_ref: reference batch size for the linear LR scaling.
         use_amp       : enable mixed-precision autocast (faster / less memory).
+        early_stop_patience : if > 0, stop once ``eval_fn`` hasn't improved for
+                        this many epochs (search-loop early stop — see
+                        ``hyperparameter_tuning.probe_ssl``). 0 (default)
+                        disables it, matching the original full-pretraining
+                        behaviour used by ``run_ssl_pipeline``.
+        eval_fn       : optional zero-arg callable returning a "higher is
+                        better" metric, called after every epoch when
+                        ``early_stop_patience`` > 0 (e.g. a downstream
+                        classifier's validation macro-F1). Ignored otherwise —
+                        it is NOT called during a normal (non-search) run, so
+                        it adds zero overhead there.
     """
     backbone = backbone.to(device)
     proj = ProjectionHead(backbone.feature_dim, hidden_dim=512, out_dim=projection_dim).to(device)
@@ -119,6 +134,7 @@ def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs
     scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
     history: dict[str, list[float]] = {"ssl_loss": []}
+    stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 and eval_fn is not None else None
     t0 = time.time()
     for epoch in range(1, epochs + 1):
         backbone.train(); proj.train()
@@ -143,7 +159,16 @@ def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs
         print(f"[SimCLR] Epoch {epoch:3d}/{epochs} | NT-Xent {epoch_loss:.4f} | "
               f"LR {optimizer.param_groups[0]['lr']:.2e}")
 
-    print(f"\n[SimCLR] Pretraining finished in {(time.time() - t0)/60:.1f} min.")
+        if stopper is not None and eval_fn is not None:
+            metric = eval_fn()
+            history.setdefault("probe_metric", []).append(metric)
+            if stopper.update(metric):
+                print(f"[SimCLR] Search early-stop at epoch {epoch}/{epochs} "
+                      f"(no probe-metric improvement for {early_stop_patience} epochs).")
+                break
+
+    print(f"\n[SimCLR] Pretraining finished in {(time.time() - t0)/60:.1f} min "
+          f"({len(history['ssl_loss'])} epoch(s) run).")
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(backbone.state_dict(), save_path)
@@ -154,7 +179,7 @@ def pretrain_simclr(backbone: nn.Module, ssl_loader, device: torch.device,epochs
 #  Rotation-prediction pretraining (alternative pretext) 
 
 def pretrain_rotation(
-    backbone: nn.Module,
+    backbone: BaseModel,
     feature_loader,
     device: torch.device,
     epochs: int = 60,
@@ -163,6 +188,8 @@ def pretrain_rotation(
     use_amp: bool = True,
     max_rot_batch: int = 256,
     save_path: str | Path | None = None,
+    early_stop_patience: int = 0,
+    eval_fn: Optional[Callable[[], float]] = None,
 ) -> dict[str, list[float]]:
     """
     Rotation-prediction pretext (Gidaris et al., 2018).
@@ -174,6 +201,10 @@ def pretrain_rotation(
     NOTE: building all 4 rotations stacks a 4x-sized tensor in memory. To avoid
     OOM with large input batches we cap the effective rotation batch at
     ``max_rot_batch`` by trimming the source batch before expansion.
+
+    ``early_stop_patience`` / ``eval_fn`` : same search-loop early-stop contract
+    as ``pretrain_simclr`` (see its docstring); both default to disabled so a
+    normal ``run_ssl_pipeline`` call is unaffected.
     """
     backbone = backbone.to(device)
     rot_head = nn.Linear(backbone.feature_dim, 4).to(device)   # 4-way rotation classifier
@@ -185,6 +216,7 @@ def pretrain_rotation(
     scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
     history: dict[str, list[float]] = {"ssl_loss": [], "ssl_acc": []}
+    stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 and eval_fn is not None else None
     t0 = time.time()
     for epoch in range(1, epochs + 1):
         backbone.train(); rot_head.train()
@@ -222,7 +254,16 @@ def pretrain_rotation(
         print(f"[Rotation] Epoch {epoch:3d}/{epochs} | loss {history['ssl_loss'][-1]:.4f} | "
               f"rot-acc {history['ssl_acc'][-1]:.4f}")
 
-    print(f"\n[Rotation] Pretraining finished in {(time.time() - t0)/60:.1f} min.")
+        if stopper is not None and eval_fn is not None:
+            metric = eval_fn()
+            history.setdefault("probe_metric", []).append(metric)
+            if stopper.update(metric):
+                print(f"[Rotation] Search early-stop at epoch {epoch}/{epochs} "
+                      f"(no probe-metric improvement for {early_stop_patience} epochs).")
+                break
+
+    print(f"\n[Rotation] Pretraining finished in {(time.time() - t0)/60:.1f} min "
+          f"({len(history['ssl_loss'])} epoch(s) run).")
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(backbone.state_dict(), save_path)
@@ -234,7 +275,7 @@ def pretrain_rotation(
 
 @torch.no_grad()
 def extract_features(
-    backbone: nn.Module,
+    backbone: BaseModel,
     loader,
     device: torch.device,
     l2_normalize: bool = True,
@@ -314,7 +355,7 @@ def fit_traditional_classifier(
 
 
 def run_ssl_pipeline(
-    backbone: nn.Module,
+    backbone: BaseModel,
     ssl_loader,
     train_feat_loader,
     val_feat_loader,
@@ -328,6 +369,7 @@ def run_ssl_pipeline(
     projection_dim: int = 128,
     use_amp: bool = True,
     save_path: str | Path | None = None,
+    seed: int = 42,
 ) -> dict:
     """
     End-to-end SSL task: pretrain → freeze → extract features → fit & score a
@@ -335,6 +377,10 @@ def run_ssl_pipeline(
 
     ``device`` defaults to ``utils.get_device()`` when omitted, so the pipeline
     resolves to MPS on the Mac and CUDA on a CUDA PC with no edits.
+
+    ``seed`` is forwarded to ``fit_traditional_classifier`` (config.SEED, so
+    the notebook's single seed knob actually reaches the read-out classifier
+    instead of a hardcoded literal).
 
     Returns a dict with the SSL training history, the fitted classifier, the
     extracted feature arrays, and validation predictions/labels (hand these to
@@ -360,7 +406,7 @@ def run_ssl_pipeline(
     print(f"[SSL] Train features {Xtr.shape} | Val features {Xva.shape}")
 
     print(f"[SSL] Fitting traditional classifier: {classifier}")
-    clf = fit_traditional_classifier(Xtr, ytr, classifier=classifier, seed=42)
+    clf = fit_traditional_classifier(Xtr, ytr, classifier=classifier, seed=seed)
     val_pred = clf.predict(Xva)
 
     return {

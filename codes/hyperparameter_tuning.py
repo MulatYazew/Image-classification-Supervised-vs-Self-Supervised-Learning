@@ -2,25 +2,33 @@
 FoodNet — Hyperparameter Tuning
 ================================
 Implements Task 5 of the exam ("tune the hyperparameters of the models to
-achieve better performance"). The search optimises **validation accuracy
-first**, while *respecting and recording* the constraints you care about:
+achieve better performance"), sized for a single Apple Silicon Mac (no
+multi-GPU cluster), while *respecting and recording* the constraints you
+care about:
 
     * the < 10 M parameter cap,
-    * peak GPU memory (MB),
+    * peak accelerator memory (MB) — CUDA gets a true peak, MPS a live
+      allocation reading, CPU reports 0 (see peak_mem_mb),
     * wall-clock time per trial (s).
 
-Design (matched to a strong multi-GPU machine)
-----------------------------------------------
+Design (kept affordable on limited, single-device compute)
+------------------------------------------------------------
   * A reproducible GRID is defined in "default_sl_grid" / "default_ssl_grid".
-    Because we have ample compute we enumerate the grid exhaustively, but each
-    trial is trained for only "probe_epochs" (a short, early-stopped probe) so
-    the sweep stays affordable; the winning config is then trained to
-    convergence by your normal training script.
-  * Selection metric = validation accuracy. Ties (within "tie_tol") are broken
-    by lower time then lower memory, so among equally-accurate configs we prefer
-    the cheaper one — exactly the trade-off the brief asks you to document.
-  * Every trial logs accuracy, params(M), peak-mem(MB) and time(s) to a tidy
-    list of dicts you can dump to CSV and drop straight into the report table.
+    Every trial is only a short "probe_epochs" run (not full training), and
+    "config.TUNE_STRATEGY" controls how much of the grid is actually probed:
+    "grid" (exhaustive — only realistic for small grids), "random" (sample
+    N configs), or "successive_halving" (start every config cheap, keep the
+    top half, double the budget, repeat). Within each probe, a candidate that
+    clearly plateaus stops early (config.TUNE_EARLY_STOP_PATIENCE) instead of
+    burning the rest of its budget. The winning config is then trained to
+    convergence separately (train.Trainer / run_supervised_pipeline).
+  * Selection metric = config.TUNE_SELECTION_METRIC, "f1_macro" by default
+    (NOT accuracy — see grid_search_over_configs for why). Ties (within
+    "tie_tol") are broken by lower time then lower memory, so among
+    equally-good configs we prefer the cheaper one.
+  * Every trial logs the metric, params(M), peak-mem(MB), time(s) and
+    epochs_run to a tidy list of dicts you can dump to CSV and drop straight
+    into the report table.
 
 The module is deliberately framework-light: it depends only on "build_model"
 and a couple of tiny callbacks, so it works for both the SL and SSL tasks.
@@ -30,14 +38,13 @@ from __future__ import annotations
 
 import itertools
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score
@@ -50,7 +57,7 @@ from model import build_model, BaseModel
 from loss_function import build_criterion
 from data_handler import compute_class_weights, check_single_imbalance_correction
 
-from utils import get_device
+from utils import get_device, LocalEarlyStopper
 
 # Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
 # installed, so the module never hard-depends on it.
@@ -85,6 +92,8 @@ class TrialResult:
     time_s: float
     under_10M: bool
     probe_epochs: int = 0
+    epochs_run: int = 0            # actual epochs this candidate trained before stopping
+                                    # (== probe_epochs unless the search-loop early stop fired)
     data_subset: str = "full"     # "full" | "capped" — was this trial run on a documented subset?
     extra: dict = field(default_factory=dict)   # e.g. per-class F1 if computed
 
@@ -99,6 +108,7 @@ class TrialResult:
             time_s=round(self.time_s, 1),
             under_10M=self.under_10M,
             probe_epochs=self.probe_epochs,
+            epochs_run=self.epochs_run,
             data_subset=self.data_subset,
         )
         r.update(self.extra)
@@ -279,11 +289,13 @@ def probe_supervised(
     use_amp: bool = True,
     grad_clip: float = 1.0,
     use_weighted_sampler: bool = False,
-) -> tuple[float, BaseModel, float]:
+    selection_metric: str = "f1_macro",
+    early_stop_patience: int = 0,
+) -> tuple[float, BaseModel, float, int]:
     """
-    Train ``model_name`` for a few epochs under ``cfg`` and return
-    ``(val_accuracy, model, val_f1_macro)``. This is a *probe*, not full
-    training: it ranks configs cheaply. The winner is later trained to
+    Train ``model_name`` for up to ``probe_epochs`` under ``cfg`` and return
+    ``(val_accuracy, model, val_f1_macro, epochs_run)``. This is a *probe*, not
+    full training: it ranks configs cheaply. The winner is later trained to
     convergence elsewhere.
 
     ``cfg`` may set ``loss_type`` ("ce"|"weighted_ce"|"focal") and
@@ -294,6 +306,16 @@ def probe_supervised(
     ``use_weighted_sampler=True``, enforced via
     ``data_handler.check_single_imbalance_correction`` so a sampler-based run
     can never accidentally double-correct.
+
+    ``early_stop_patience`` > 0 evaluates ``selection_metric`` on ``val_loader``
+    after EVERY epoch (not just once at the end) and stops this candidate as
+    soon as ``epochs_since_improvement >= early_stop_patience`` — a search-loop
+    local early stop, independent of ``Trainer``'s own ``PATIENCE`` (which only
+    governs the Phase C full retrain). 0 (default) disables it and keeps the
+    original single-evaluation-at-the-end behaviour. The returned
+    ``val_accuracy``/``val_f1_macro`` are the values from THIS candidate's best
+    epoch (not necessarily its last), since that is the value the early-stop
+    counter tracked against.
     """
     model = build_model(
         cfg["model_name"], num_classes=num_classes,
@@ -322,6 +344,33 @@ def probe_supervised(
     amp_on = use_amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
+    def _validate() -> tuple[float, float]:
+        # Validation accuracy AND macro-F1 (the selection metric — see
+        # config.TUNE_SELECTION_METRIC). Accuracy alone can look fine at epoch 5
+        # while the ~19:1 imbalance means tail classes are being ignored entirely.
+        model.eval()
+        correct, total = 0, 0
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for images, labels in tqdm(val_loader, desc="probe val", leave=False, unit="batch"):
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                with torch.amp.autocast(device.type, enabled=amp_on):
+                    preds = model(images).argmax(1)
+                correct += (preds.cpu() == labels.cpu()).sum().item()
+                total += labels.size(0)
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
+        acc = correct / max(total, 1)
+        f1_macro = f1_score(np.concatenate(all_labels), np.concatenate(all_preds),
+                            average="macro", zero_division=0)
+        model.train()
+        return acc, f1_macro
+
+    stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 else None
+    best_val_acc, best_val_f1_macro = 0.0, 0.0
+    epochs_run = 0
+
     for epoch in range(1, probe_epochs + 1):
         model.train()
         run_loss, run_correct, run_n = 0.0, 0, 0
@@ -347,27 +396,24 @@ def probe_supervised(
                 bar.set_postfix(loss=f"{run_loss / max(run_n, 1):.3f}",
                                 acc=f"{run_correct / max(run_n, 1):.3f}")
         scheduler.step()
+        epochs_run = epoch
 
-    # Validation accuracy AND macro-F1 (the selection metric — see
-    # config.TUNE_SELECTION_METRIC). Accuracy alone can look fine at epoch 5
-    # while the ~19:1 imbalance means tail classes are being ignored entirely.
-    model.eval()
-    correct, total = 0, 0
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for images, labels in tqdm(val_loader, desc="probe val", leave=False, unit="batch"):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            with torch.amp.autocast(device.type, enabled=amp_on):
-                preds = model(images).argmax(1)
-            correct += (preds.cpu() == labels.cpu()).sum().item()
-            total += labels.size(0)
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-    val_acc = correct / max(total, 1)
-    val_f1_macro = f1_score(np.concatenate(all_labels), np.concatenate(all_preds),
-                            average="macro", zero_division=0)
-    return val_acc, model, val_f1_macro
+        if stopper is not None:
+            val_acc, val_f1_macro = _validate()
+            current = val_f1_macro if selection_metric == "f1_macro" else val_acc
+            improved = stopper.best is None or current > stopper.best + stopper.min_delta
+            stop_now = stopper.update(current)
+            if improved:
+                best_val_acc, best_val_f1_macro = val_acc, val_f1_macro
+            if stop_now:
+                print(f"[tune] search early-stop at epoch {epoch}/{probe_epochs} "
+                      f"(no {selection_metric} improvement for {early_stop_patience} epochs)")
+                break
+
+    if stopper is None:
+        best_val_acc, best_val_f1_macro = _validate()
+
+    return best_val_acc, model, best_val_f1_macro, epochs_run
 
 
 #  Main grid-search driver 
@@ -379,7 +425,7 @@ def _metric_of(result: TrialResult, selection_metric: str) -> float:
 
 def grid_search(
     grid: dict[str, list],
-    probe_fn: Callable[..., tuple[float, BaseModel, float]],
+    probe_fn: Callable[..., tuple[float, BaseModel, float, int]],
     device: torch.device,
     tie_tol: float = 0.005,
     verbose: bool = True,
@@ -415,7 +461,7 @@ def grid_search(
 
 def grid_search_over_configs(
     configs: list[dict],
-    probe_fn: Callable[..., tuple[float, BaseModel, float]],
+    probe_fn: Callable[..., tuple[float, BaseModel, float, int]],
     device: torch.device,
     tie_tol: float = 0.005,
     verbose: bool = True,
@@ -464,7 +510,8 @@ def grid_search_over_configs(
 
         reset_peak_mem(device)
         t0 = time.time()
-        val_acc, _, val_f1_macro = probe_fn(cfg, device=device, **probe_kwargs)
+        val_acc, _, val_f1_macro, epochs_run = probe_fn(
+            cfg, device=device, selection_metric=selection_metric, **probe_kwargs)
         elapsed = time.time() - t0
         peak = peak_mem_mb(device)
 
@@ -472,7 +519,7 @@ def grid_search_over_configs(
             config=cfg, val_accuracy=val_acc, val_f1_macro=val_f1_macro,
             params_M=info["total_params_M"], peak_mem_MB=peak, time_s=elapsed,
             under_10M=True, probe_epochs=probe_kwargs.get("probe_epochs", 0),
-            data_subset=data_subset,
+            epochs_run=epochs_run, data_subset=data_subset,
         )
         results.append(res)
         if config_bar is not None:
@@ -511,7 +558,7 @@ def grid_search_over_configs(
 
 def successive_halving_search(
     configs: list[dict],
-    probe_fn: Callable[..., tuple[float, BaseModel, float]],
+    probe_fn: Callable[..., tuple[float, BaseModel, float, int]],
     device: torch.device,
     initial_epochs: int,
     selection_metric: str = "f1_macro",
@@ -638,6 +685,7 @@ def tune_supervised(
     use_weighted_sampler: bool = False,
     data_subset: str = "full",
     seed: int = 42,
+    early_stop_patience: int = 0,
 ) -> tuple[TrialResult, list[TrialResult]]:
     """
     One-call SL hyperparameter sweep. Returns ``(best, all_results)`` and, if
@@ -652,6 +700,11 @@ def tune_supervised(
                                  ``probe_epochs``, keep the top half, double
                                  the budget, repeat (config.TUNE_STRATEGY).
 
+    ``early_stop_patience`` (config.TUNE_EARLY_STOP_PATIENCE) is forwarded to
+    ``probe_supervised``: each candidate stops as soon as it plateaus for that
+    many epochs, instead of always burning the full ``probe_epochs`` budget.
+    0 disables it (original behaviour).
+
     ``device`` defaults to ``utils.get_device()`` when omitted, so the same call
     resolves to MPS on the Mac and CUDA on your friend's PC with no edits.
     """
@@ -660,6 +713,7 @@ def tune_supervised(
     probe_kwargs = dict(
         train_loader=train_loader, val_loader=val_loader,
         num_classes=num_classes, use_weighted_sampler=use_weighted_sampler,
+        early_stop_patience=early_stop_patience,
     )
 
     if strategy == "grid":
@@ -701,16 +755,28 @@ def probe_ssl(
     probe_epochs: int = 10,
     num_classes: int = 251,
     use_amp: bool = True,
-) -> tuple[float, BaseModel, float]:
+    selection_metric: str = "f1_macro",
+    early_stop_patience: int = 0,
+) -> tuple[float, BaseModel, float, int]:
     """
     One SSL trial under cfg: short pretrain (no labels) -> freeze -> extract
     features -> fit the chosen traditional classifier -> return its validation
     accuracy AND macro-F1. Mirrors probe_supervised's (val_acc, model,
-    val_f1_macro) contract so the SAME search driver works for SSL. method is
-    fixed per call (simclr or rotation). The traditional classifier already
-    applies class_weight="balanced" for logreg/linear_svm (see
+    val_f1_macro, epochs_run) contract so the SAME search driver works for SSL.
+    method is fixed per call (simclr or rotation). The traditional classifier
+    already applies class_weight="balanced" for logreg/linear_svm (see
     self_supervised.fit_traditional_classifier) so this probe reflects the
     same imbalance handling as the final SSL run.
+
+    ``early_stop_patience`` > 0 refits the downstream classifier and evaluates
+    ``selection_metric`` after EVERY pretraining epoch, stopping as soon as it
+    plateaus for that many epochs (see ``self_supervised.pretrain_simclr`` /
+    ``pretrain_rotation``'s ``eval_fn`` contract). This is more expensive per
+    epoch than the original single-fit-at-the-end probe (a classifier is
+    fit every epoch instead of once), but bounded by ``probe_epochs`` and only
+    engaged during the search — the final SSL retrain (``run_ssl_pipeline``)
+    never passes ``early_stop_patience`` and is unaffected. 0 (default)
+    disables it and keeps the original cheap behaviour.
     """
     from .self_supervised import (
         pretrain_simclr, pretrain_rotation, extract_features,
@@ -723,29 +789,51 @@ def probe_ssl(
         dropout=cfg.get("dropout", 0.3), width_mult=cfg.get("width_mult", 1.0),
     ).to(device)
 
+    best = {"acc": 0.0, "f1_macro": 0.0, "metric": None}
+
+    def eval_fn() -> float:
+        Xtr, ytr = extract_features(backbone, train_feat_loader, device)
+        Xva, yva = extract_features(backbone, val_feat_loader, device)
+        clf = fit_traditional_classifier(Xtr, ytr, classifier=cfg.get("classifier", "logreg"))
+        pred = clf.predict(Xva)
+        acc = accuracy_score(yva, pred)
+        f1_macro = _f1_score(yva, pred, average="macro", zero_division=0)
+        current = f1_macro if selection_metric == "f1_macro" else acc
+        if best["metric"] is None or current > best["metric"]:
+            best.update(acc=acc, f1_macro=f1_macro, metric=current)
+        return current
+
+    use_search_eval = early_stop_patience > 0
     if method == "simclr":
-        pretrain_simclr(
+        hist = pretrain_simclr(
             backbone, ssl_loader, device,
             epochs=probe_epochs, lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-4),
             temperature=cfg.get("temperature", 0.5),
             projection_dim=cfg.get("projection_dim", 128), use_amp=use_amp,
+            early_stop_patience=early_stop_patience, eval_fn=eval_fn if use_search_eval else None,
         )
     elif method == "rotation":
-        pretrain_rotation(
+        hist = pretrain_rotation(
             backbone, ssl_loader, device,
             epochs=probe_epochs, lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-4),
             use_amp=use_amp,
+            early_stop_patience=early_stop_patience, eval_fn=eval_fn if use_search_eval else None,
         )
     else:
         raise ValueError(f"Unknown SSL method '{method}'. Choose: simclr, rotation.")
 
-    Xtr, ytr = extract_features(backbone, train_feat_loader, device)
-    Xva, yva = extract_features(backbone, val_feat_loader, device)
-    clf = fit_traditional_classifier(Xtr, ytr, classifier=cfg.get("classifier", "logreg"))
-    val_pred = clf.predict(Xva)
-    val_acc = accuracy_score(yva, val_pred)
-    val_f1_macro = _f1_score(yva, val_pred, average="macro", zero_division=0)
-    return val_acc, backbone, val_f1_macro
+    epochs_run = len(hist.get("ssl_loss", []))
+    if use_search_eval and best["metric"] is not None:
+        val_acc, val_f1_macro = best["acc"], best["f1_macro"]
+    else:
+        # Original cheap behaviour: fit the classifier once, at the very end.
+        Xtr, ytr = extract_features(backbone, train_feat_loader, device)
+        Xva, yva = extract_features(backbone, val_feat_loader, device)
+        clf = fit_traditional_classifier(Xtr, ytr, classifier=cfg.get("classifier", "logreg"))
+        val_pred = clf.predict(Xva)
+        val_acc = accuracy_score(yva, val_pred)
+        val_f1_macro = _f1_score(yva, val_pred, average="macro", zero_division=0)
+    return val_acc, backbone, val_f1_macro, epochs_run
 
 
 def deduplicate_ssl_configs(configs: list[dict], method: str) -> list[dict]:
@@ -776,6 +864,7 @@ def tune_ssl(
     num_classes: int = 251,
     csv_path: str | None = None,
     selection_metric: str = "f1_macro",
+    early_stop_patience: int = 0,
 ) -> tuple[TrialResult, list[TrialResult]]:
     """
     Tune ONE SSL pretext method (simclr or rotation). Returns (best, all_results).
@@ -786,6 +875,9 @@ def tune_ssl(
     traditional classifier's ``class_weight="balanced"`` (self_supervised.py)
     already accounts for imbalance, but ranking by macro-F1 still avoids a
     scheme that wins on accuracy while starving the tail classes.
+
+    ``early_stop_patience`` (config.SSL_TUNE_EARLY_STOP_PATIENCE) is forwarded
+    to ``probe_ssl``; 0 disables it (original behaviour).
 
     device defaults to utils.get_device() (MPS on the Mac, CUDA on a CUDA PC).
     """
@@ -800,6 +892,7 @@ def tune_ssl(
         train_feat_loader=train_feat_loader,
         val_feat_loader=val_feat_loader,
         method=method, probe_epochs=probe_epochs, num_classes=num_classes,
+        early_stop_patience=early_stop_patience,
     )
     if csv_path:
         results_to_csv(results, csv_path)

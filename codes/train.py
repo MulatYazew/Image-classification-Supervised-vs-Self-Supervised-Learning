@@ -29,9 +29,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 # trainer never hard-depends on it.
 try:
     from tqdm.auto import tqdm
-    _HAS_TQDM = True
+    HAS_TQDM = True
 except ImportError:  # pragma: no cover
-    _HAS_TQDM = False
+    HAS_TQDM = False
 
     def tqdm(iterable=None, *args, **kwargs):   # type: ignore
         return iterable if iterable is not None else iter(())
@@ -104,20 +104,20 @@ class Trainer:
 
     #  Single epoch
 
-    def _mixup_batch(self, images: torch.Tensor, labels: torch.Tensor):
+    def mixup_batch(self, images: torch.Tensor, labels: torch.Tensor):
         """Apply MixUp to a batch.  Returns (mixed_images, y_a, y_b, lam)."""
         lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
         idx = torch.randperm(images.size(0), device=images.device)
         mixed = lam * images + (1.0 - lam) * images[idx]
         return mixed, labels, labels[idx], lam
 
-    def _cutmix_batch(self, images: torch.Tensor, labels: torch.Tensor):
+    def cutmix_batch(self, images: torch.Tensor, labels: torch.Tensor):
         """
         Apply CutMix to a batch: paste a random box from a shuffled copy of
         the batch into each image, and mix the labels by the actual (not
         sampled) box area — the standard CutMix recipe. Returns
         ``(mixed_images, y_a, y_b, lam)`` with the same contract as
-        ``_mixup_batch`` so ``run_epoch`` can treat both uniformly.
+        ``mixup_batch`` so ``run_epoch`` can treat both uniformly.
         """
         lam_sampled = float(np.random.beta(self.cutmix_alpha, self.cutmix_alpha))
         idx = torch.randperm(images.size(0), device=images.device)
@@ -151,7 +151,7 @@ class Trainer:
                     self.optimizer.zero_grad(set_to_none=True)
 
                 if use_mix:
-                    mix_fn = self._mixup_batch if self.mix_method == "mixup" else self._cutmix_batch
+                    mix_fn = self.mixup_batch if self.mix_method == "mixup" else self.cutmix_batch
                     images, y_a, y_b, lam = mix_fn(images, labels)
                     with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
                         outputs = self.model(images)
@@ -178,7 +178,7 @@ class Trainer:
                 total_loss += loss.item() * images.size(0)
                 correct += hits
                 n += labels.size(0)
-                if _HAS_TQDM:
+                if HAS_TQDM:
                     bar.set_postfix(loss=f"{total_loss / max(n, 1):.3f}",
                                     acc=f"{correct / max(n, 1):.3f}")
         return total_loss / max(n, 1), correct / max(n, 1)

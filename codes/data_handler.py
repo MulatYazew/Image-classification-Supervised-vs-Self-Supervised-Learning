@@ -309,26 +309,20 @@ class SSLPairDataset(Dataset):
         return view1, view2
 
 
-class FeatureExtractionDataset(Dataset):
+class FeatureExtractionDataset(FoodDataset):
     """
     Deterministic (no-augmentation) dataset used to extract frozen-backbone
     features for the SSL → traditional-classifier pipeline. Returns
     ``(image_tensor, label)`` so the traditional classifier can be fit/scored.
+
+    A clearly-named, no-augmentation alias for ``FoodDataset`` — same
+    ``(image, label)`` contract, just named for where it's actually used so
+    call sites read as intent ("extract features") rather than an
+    augmentation flag.
     """
 
     def __init__(self, dataframe: pd.DataFrame, images_dir: str | Path, image_size: int = 224) -> None:
-        self.df = dataframe.reset_index(drop=True)
-        self.images_dir = Path(images_dir)
-        self.tf = get_transforms(image_size, augment=False)
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        row = self.df.iloc[idx]
-        image = read_rgb(self.images_dir / row["image_id"])
-        image = self.tf(image=image)["image"]
-        return image, torch.tensor(int(row["label"]), dtype=torch.long)
+        super().__init__(dataframe, images_dir, augment=False, image_size=image_size)
 
 
 #  Class-weight / sampler / minority helpers
@@ -348,6 +342,15 @@ def compute_tail_classes(dataframe: pd.DataFrame, num_classes: int = 251,
     counts = dataframe["label"].value_counts().reindex(range(num_classes), fill_value=0)
     n_tail = max(1, int(round(num_classes * tail_frac)))
     return set(counts.sort_values(kind="mergesort").index[:n_tail].tolist())
+
+
+def _label_counts(dataframe: pd.DataFrame, num_classes: int) -> torch.Tensor:
+    """Per-class image counts as a dense ``(num_classes,)`` tensor, vectorised
+    (``value_counts`` + ``reindex``) rather than looping row-by-row in Python
+    — shared by ``compute_class_weights`` and ``build_weighted_sampler``.
+    """
+    counts = dataframe["label"].value_counts().reindex(range(num_classes), fill_value=0)
+    return torch.tensor(counts.to_numpy(), dtype=torch.float)
 
 
 def check_single_imbalance_correction(use_weighted_sampler: bool,
@@ -395,10 +398,7 @@ def compute_class_weights(dataframe: pd.DataFrame, num_classes: int = 251,
     Pass the result to CrossEntropy / Focal — and use EITHER this OR a weighted
     sampler, never both (see config.USE_WEIGHTED_SAMPLER / loss.py).
     """
-    counts = torch.zeros(num_classes)
-    for label in dataframe["label"]:
-        counts[int(label)] += 1
-    counts = counts.clamp(min=1.0)
+    counts = _label_counts(dataframe, num_classes).clamp(min=1.0)
 
     if scheme == "inv":
         w = counts.sum() / (num_classes * counts)
@@ -426,13 +426,8 @@ def build_weighted_sampler(dataframe: pd.DataFrame, num_classes: int = 251) -> W
     rarest classes are oversampled with replacement. Combining this with weighted
     loss would double-correct, so pick exactly one (config.USE_WEIGHTED_SAMPLER).
     """
-    counts = torch.zeros(num_classes)
-    for label in dataframe["label"]:
-        counts[int(label)] += 1
-    counts = counts.clamp(min=1.0)
+    counts = _label_counts(dataframe, num_classes).clamp(min=1.0)
     inv_freq = 1.0 / counts                       # raw inverse frequency per class
-    sample_weights = torch.tensor(
-        [inv_freq[int(lbl)] for lbl in dataframe["label"]],
-        dtype=torch.float,
-    )
+    labels = torch.from_numpy(dataframe["label"].to_numpy().astype("int64"))
+    sample_weights = inv_freq[labels]
     return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)

@@ -93,6 +93,9 @@ class BaseModel(ABC, nn.Module):
 
     NAME: str = "base"
 
+    backbone: nn.Module                        # MUST be set inside build()
+    head: nn.Module                            # MUST be set inside build()
+
     def __init__(self, num_classes: int = 251, dropout: float = 0.3, width_mult: float = 1.0) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -187,30 +190,43 @@ def conv_batchnorm_activation(in_ch: int, out_ch: int, k: int = 3, s: int = 1, p
 
 class SqueezeExcite(nn.Module):
     """
-    Squeeze-and-Excitation channel attention (AMP-safe).
+    Squeeze-and-Excitation channel attention (AMP-safe), shared by both
+    architectures' blocks below.
 
     'Squeeze' = global-average-pool each channel to a scalar; 'excite' = a tiny
-    bottleneck MLP learns a per-channel gate in [0, 1] that rescales the feature
-    map. The gate is computed in fp32 (autocast disabled) so the sigmoid does not
-    saturate under mixed precision during SSL pretraining. ``r`` is the reduction
-    ratio (larger r ⇒ cheaper, weaker); r=16 is the standard SE setting.
+    bottleneck MLP learns a per-channel gate that rescales the feature map. The
+    gate is computed in fp32 (autocast disabled) so it does not saturate under
+    mixed precision during SSL pretraining.
+
+    Two call conventions, both used below:
+      * FoodNet30's ``DepthwiseSeparable`` (standard SE): reduction computed
+        from the SAME channels the gate operates on (``reduction=16``),
+        sigmoid gate.
+      * FoodNet46's ``MBConvBlock`` (EfficientNet-style SE): pass
+        ``reduction_channels`` explicitly, computed by the caller from the
+        block's PRE-EXPANSION input channels rather than the expanded width
+        the gate actually operates on (ties the SE bottleneck to the
+        original information content, not the inflated expansion size), with
+        a hardsigmoid gate (``hard_gate=True``).
     """
 
-    def __init__(self, channels: int, reduction: int = 16) -> None:
+    def __init__(self, channels: int, reduction: int = 16,
+                 reduction_channels: int | None = None, hard_gate: bool = False) -> None:
         super().__init__()
-        hidden = max(8, channels // reduction)
-        self.squeeze = nn.AdaptiveAvgPool2d(1)       # (B,C,H,W) → (B,C,1,1)
+        hidden = reduction_channels if reduction_channels is not None else max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)           # (B,C,H,W) → (B,C,1,1)
         self.fc1 = nn.Linear(channels, hidden)
         self.act = nn.ReLU(inplace=True)
         self.fc2 = nn.Linear(hidden, channels)
+        self.hard_gate = hard_gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, _, _ = x.shape
-        s = self.squeeze(x).view(b, c)               # squeeze
-        # Compute the gate in fp32 so the sigmoid doesn't saturate under AMP.
+        s = self.pool(x).view(b, c)                   # squeeze
+        # Compute the gate in fp32 so it doesn't saturate under AMP.
         with torch.autocast(device_type=x.device.type, enabled=False):
             s = self.fc2(self.act(self.fc1(s.float())))
-            w = torch.sigmoid(s)                      # excite: per-channel gate in [0,1]
+            w = F.hardsigmoid(s) if self.hard_gate else torch.sigmoid(s)   # excite
         w = w.to(x.dtype).view(b, c, 1, 1)
         return x * w                                  # channel-wise recalibration
 
@@ -293,37 +309,6 @@ class DropPath(nn.Module):
         return x.div(survival) * noise
 
 
-class SEBlock(nn.Module):
-    """
-    Squeeze-and-Excitation block (AMP-safe hard-sigmoid gate).
-
-    Unlike the SqueezeExcite class used in the original FoodNet (which applies
-    the SE gate to the EXPANDED channels with a 1/16 reduction), this version
-    uses ``hidden = max(8, in_ch // se_ratio)`` where ``in_ch`` is the
-    PRE-EXPANSION channel width of the MBConv block. This follows the
-    EfficientNet design rationale: the SE bottleneck is tied to the original
-    input channels (information content), not the inflated expansion width,
-    giving better accuracy-per-parameter.
-
-    The gate is computed in fp32 even under AMP so the Hardsigmoid does not
-    saturate in fp16 (same pattern as the existing SqueezeExcite class).
-    """
-
-    def __init__(self, expanded_ch: int, se_hidden: int) -> None:
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Linear(expanded_ch, se_hidden)
-        self.fc2 = nn.Linear(se_hidden, expanded_ch)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, _, _ = x.shape
-        s = self.pool(x).view(b, c)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            s = F.relu(self.fc1(s.float()))
-            w = F.hardsigmoid(self.fc2(s))
-        return x * w.to(x.dtype).view(b, c, 1, 1)
-
-
 class MBConvBlock(nn.Module):
     """
     Inverted Residual Block (MBConv) — the core building block of FoodNetV2.
@@ -363,7 +348,7 @@ class MBConvBlock(nn.Module):
                       groups=exp_ch, bias=False),
             nn.BatchNorm2d(exp_ch),
             nn.Hardswish(inplace=True),
-            SEBlock(exp_ch, se_hidden),
+            SqueezeExcite(exp_ch, reduction_channels=se_hidden, hard_gate=True),
             nn.Conv2d(exp_ch, out_ch, 1, bias=False),
             nn.BatchNorm2d(out_ch),
         ]
@@ -591,26 +576,7 @@ def build_model(name: str, num_classes: int = 251, dropout: float = 0.3,
     return model
 
 
-def create_model(num_classes: int = 251, pretrained: bool = False,
-                 model_name: str = "foodnet46") -> BaseModel:
-    """
-    Legacy alias kept for compatibility with older scripts.
-
-    ``pretrained`` is ignored — the exam forbids pretrained weights.
-    Default is ``foodnet46`` (46-layer MBConv model).
-    """
-    if pretrained:
-        import warnings
-        warnings.warn(
-            "pretrained weights are NOT used in this project (forbidden by the spec); "
-            "ignoring pretrained=True.",
-            UserWarning,
-            stacklevel=2,
-        )
-    return build_model(name=model_name, num_classes=num_classes)
-
-
-#  Self-check / parameter-budget report 
+#  Self-check / parameter-budget report
 
 if __name__ == "__main__":
     print(f"{'model':<18}{'total(M)':>10}{'feat_dim':>10}{'<10M?':>8}")

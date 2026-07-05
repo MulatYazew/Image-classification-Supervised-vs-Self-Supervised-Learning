@@ -74,9 +74,6 @@ class Evaluator:
             "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
         }
 
-    def compute_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-        return self.metrics_from_predictions(y_true, y_pred)
-
     def per_class_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> pd.DataFrame:
         """
         Per-class precision/recall/F1/support — NOT just the macro average.
@@ -146,7 +143,7 @@ class Evaluator:
             for images, labels in loader:
                 images = images.to(device)
                 topk = model(images).topk(k, dim=1).indices.cpu()
-                correct += sum(labels[i] in topk[i] for i in range(len(labels)))
+                correct += (topk == labels.unsqueeze(1)).any(dim=1).sum().item()
                 n += len(labels)
         return correct / max(n, 1)
 
@@ -183,7 +180,7 @@ class Evaluator:
         return {
             "predictions": y_pred,
             "true_labels": y_true,
-            "metrics": self.compute_metrics(y_true, y_pred),
+            "metrics": self.metrics_from_predictions(y_true, y_pred),
             "confusion_matrix": confusion_matrix(y_true, y_pred),
         }
 
@@ -224,6 +221,36 @@ def plot_training_curves(history: dict, save_path: str | None = None) -> None:
     ax2.plot(history["train_acc"], label="train")
     ax2.plot(history["val_acc"], label="val")
     ax2.set_title("Accuracy"); ax2.set_xlabel("epoch"); ax2.legend()
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.show()
+
+
+def plot_ssl_curves(history: dict, method: str = "", save_path: str | None = None) -> None:
+    """
+    Plot an SSL pretraining history dict (``self_supervised.pretrain_simclr`` /
+    ``pretrain_rotation``): the pretext ``ssl_loss`` per epoch, plus
+    ``ssl_acc`` (rotation's 4-way prediction accuracy) when present.
+
+    Unlike ``plot_training_curves`` (which expects a supervised ``Trainer``
+    history's train/val loss+accuracy KEYS), SSL pretraining has no labelled
+    validation split during the pretext task itself — there is one loss curve
+    (SimCLR NT-Xent, or rotation cross-entropy + its own accuracy), not a
+    train-vs-val pair, hence a dedicated plot rather than reusing
+    ``plot_training_curves`` on a differently-shaped dict.
+    """
+    has_acc = bool(history.get("ssl_acc"))
+    fig, axes = plt.subplots(1, 2 if has_acc else 1, figsize=(14, 5) if has_acc else (7, 5))
+    ax1 = axes[0] if has_acc else axes
+    ax1.plot(history["ssl_loss"], label="ssl_loss")
+    ax1.set_title(f"{method} pretext loss".strip() or "SSL pretext loss")
+    ax1.set_xlabel("epoch"); ax1.legend()
+    if has_acc:
+        ax2 = axes[1]
+        ax2.plot(history["ssl_acc"], label="ssl_acc", color="tab:orange")
+        ax2.set_title(f"{method} pretext accuracy".strip() or "SSL pretext accuracy")
+        ax2.set_xlabel("epoch"); ax2.legend()
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=120, bbox_inches="tight")

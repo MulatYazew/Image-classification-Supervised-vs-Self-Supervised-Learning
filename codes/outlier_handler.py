@@ -23,11 +23,18 @@ Usage
     final_df = apply_review_decisions(df, ["confirmed_remove_stage2.csv",
                                             "confirmed_remove_stage3.csv"],
                                        output_csv="train_labels_clean.csv")
+
+Rerunning without rescanning every image: check outlier_stage_outputs_exist(out_dir)
+first and, if True, call load_cached_outlier_outputs(csv_path, out_dir, skip_stage3)
+instead of run_outlier_pipeline — see the notebook's Section 3 for the guarded
+if/else this expands to.
 """
 
 import os
 import warnings
 warnings.filterwarnings("ignore")
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -463,27 +470,27 @@ def detect_nonfood_pixel_outliers(
             fail_reasons[idx].append(f"EXTREME:{stat}={stats_df.at[idx, stat]:.3f}")
         fail_mask |= extreme
 
-    #  Per-class z-score: intra-class statistical outliers 
+    #  Per-class z-score: intra-class statistical outliers
     # For classes with enough samples, compute each image's z-score relative to
     # its class's distribution for each feature.  A high z-score indicates the
     # image looks unlike its peers — useful for catching label errors and
     # cross-class contamination that global thresholds miss.
-    class_sizes = stats_df.groupby("label").size()
+    # Vectorised (groupby().transform()) rather than a per-row Python loop —
+    # at ~118K images x 4 features that loop was ~470K iterations of the
+    # notoriously slow DataFrame.iterrows(), for pure numerical work that
+    # pandas can broadcast in one shot.
+    row_class_size = stats_df["label"].map(stats_df.groupby("label").size())
     for stat in FOOD_STATS_BOUNDS:
-        cstats = stats_df.groupby("label")[stat].agg(["mean", "std"])
-        for idx, r in stats_df.iterrows():
-            cls = r["label"]
-            # Skip classes too small for meaningful statistics.
-            if class_sizes.get(cls, 0) < min_class_size:
-                continue
-            cmean, cstd = cstats.at[cls, "mean"], cstats.at[cls, "std"]
-            # Skip degenerate classes where all values are identical (std ≈ 0).
-            if pd.isna(cstd) or cstd < 1e-6:
-                continue
-            z = abs(r[stat] - cmean) / cstd
-            if z > class_zscore_thr:
-                fail_reasons[idx].append(f"class_z:{stat}={z:.1f}sigma")
-                fail_mask[idx] = True
+        class_mean = stats_df.groupby("label")[stat].transform("mean")
+        class_std = stats_df.groupby("label")[stat].transform("std")
+        # Skip classes too small for meaningful statistics, and degenerate
+        # classes where all values are identical (std ≈ 0).
+        valid = (row_class_size >= min_class_size) & class_std.notna() & (class_std >= 1e-6)
+        z = (stats_df[stat] - class_mean).abs() / class_std
+        flagged = valid & (z > class_zscore_thr)
+        for idx in stats_df.index[flagged]:
+            fail_reasons[idx].append(f"class_z:{stat}={z.at[idx]:.1f}sigma")
+        fail_mask |= flagged
 
     # Low unique-colour count: synthetic or solid-fill images 
     # After downsampling to 64×64, genuine photographs have hundreds of
@@ -507,6 +514,14 @@ def detect_nonfood_pixel_outliers(
         path = os.path.join(out_dir, "review_stage2_nonfood_pixelstats.csv")
         flagged_df.to_csv(path, index=False)
         print(f"  -> saved: {path}")
+
+    # Full per-image stats table (not just the flagged subset) — persisted so a
+    # cached rerun (load_cached_outlier_outputs) can reload stats_df without
+    # rescanning every image's pixel statistics.
+    os.makedirs(out_dir, exist_ok=True)
+    full_stats_path = os.path.join(out_dir, "stage2_pixel_stats_full.csv")
+    stats_df.to_csv(full_stats_path, index=False)
+    print(f"  -> saved full pixel-stats table (all images): {full_stats_path}")
 
     return stats_df, flagged_df
 
@@ -697,8 +712,11 @@ def detect_nonfood_embedding_outliers(
     backbone.eval().to(device)
 
     # Stream all images through the backbone to collect embeddings 
+    # pin_memory only speeds up host->device copies on CUDA; on MPS/CPU it is a
+    # pure overhead (and was previously mis-set True for "mps", the opposite of
+    # the intended rule).
     dl = DataLoader(FlatFoodDataset(df, img_dir), batch_size=batch_size, shuffle=False,
-                     num_workers=num_workers, pin_memory=(device == "mps"))
+                     num_workers=num_workers, pin_memory=(str(device) == "cuda"))
 
     feats_list, all_ids, all_labels = [], [], []
     with torch.no_grad():   # disable gradient computation for inference efficiency
@@ -765,6 +783,17 @@ def detect_nonfood_embedding_outliers(
         path = os.path.join(out_dir, "review_stage3_nonfood_embedding.csv")
         outlier_df.to_csv(path, index=False)
         print(f"  -> saved: {path}")
+
+    # Persist the (expensive-to-recompute: ResNet-50 forward pass over every
+    # image) PCA embeddings + anomaly scores for ALL images, so a cached rerun
+    # (load_cached_outlier_outputs) can reload feats/global_scores/
+    # per_class_scores — e.g. for plot_anomaly_score_distribution — without
+    # redoing the feature extraction.
+    os.makedirs(out_dir, exist_ok=True)
+    npz_path = os.path.join(out_dir, "stage3_embeddings.npz")
+    np.savez_compressed(npz_path, feats=feats_pca, ids=np.array(all_ids),
+                        global_scores=global_scores, per_class_scores=per_class_scores)
+    print(f"  -> saved embeddings/scores: {npz_path}")
 
     return feats_pca, all_ids, global_scores, per_class_scores, outlier_df
 
@@ -898,6 +927,50 @@ def visualize_flagged_images(flagged_df, img_dir, title="Flagged images",
         print(f"  -> saved grid: {save_path}")
     else:
         plt.show()
+    plt.close()
+
+
+def plot_before_after_class_counts(raw_df, final_df, num_classes: int = 251,
+                                   title: str = "Images per class — before vs. after outlier removal",
+                                   save_path=None) -> None:
+    """Grouped bar chart of images-per-class before (raw manifest) vs. after
+    (final cleaned manifest) outlier removal, classes sorted by raw count.
+
+    The single clearest figure for "what did outlier removal actually do":
+    a per-class view of how much each class shrank, rather than just the
+    aggregate before/after totals.
+
+    Parameters
+    ----------
+    raw_df, final_df : pd.DataFrame
+        Manifests with a ``label`` column, before and after cleaning.
+    num_classes : int
+        Total number of classes (251, fixed by the spec).
+    save_path : str or None
+        If provided, the figure is saved here instead of only being shown.
+    """
+    idx = range(num_classes)
+    raw_counts = raw_df["label"].value_counts().reindex(idx, fill_value=0)
+    final_counts = final_df["label"].value_counts().reindex(idx, fill_value=0)
+    order = raw_counts.sort_values(ascending=False).index
+
+    fig, ax = plt.subplots(figsize=(14, 5), facecolor=BG)
+    ax.set_facecolor(PANEL)
+    x = np.arange(num_classes)
+    ax.bar(x, raw_counts.loc[order].values, width=1.0, color=ACCENT, alpha=0.6, label="before (raw)")
+    ax.bar(x, final_counts.loc[order].values, width=1.0, color=LINE, alpha=0.9, label="after (cleaned)")
+
+    ax.set_xlabel("class rank (sorted by raw count)", color="white")
+    ax.set_ylabel("image count", color="white")
+    ax.set_title(title, color="white", fontweight="bold")
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color(SPINE)
+    ax.legend(labelcolor="white", facecolor=BG, edgecolor=SPINE)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight", dpi=120, facecolor=fig.get_facecolor())
+        print(f"  -> saved: {save_path}")
+    plt.show()
     plt.close()
 
 
@@ -1312,3 +1385,81 @@ def run_outlier_pipeline(
     print(f"{'-' * 60}\n")
 
     return df, stats_df, flagged2, feats, image_ids, global_scores, per_class_scores, flagged3
+
+
+# Idempotency helpers (skip the 3-stage scan on repeat notebook runs)
+
+# The 3-stage scan opens every image on disk (Stage 1 + 2) and runs a
+# ResNet-50 forward pass over the whole dataset (Stage 3) — expensive to
+# redo every time the notebook is rerun. run_outlier_pipeline now also
+# persists a FULL stats table (stage2_pixel_stats_full.csv) and the stage-3
+# embeddings/scores (stage3_embeddings.npz); the caller (the notebook) checks
+# outlier_stage_outputs_exist() itself and decides whether to call
+# run_outlier_pipeline or reload via load_cached_outlier_outputs, so that
+# decision is visible where the pipeline is actually invoked, not hidden
+# inside a wrapper function.
+
+
+def outlier_stage_outputs_exist(out_dir: str, skip_stage3: bool = False) -> bool:
+    """
+    True if the outputs the 3-stage scan writes unconditionally (for every
+    image, on every run) already exist under out_dir.
+
+    NOTE: review_stage2_nonfood_pixelstats.csv / review_stage3_nonfood_embedding.csv
+    are NOT checked here even though they are the actual flagged-outlier
+    review files — they are only written when at least one image is
+    actually flagged, so a clean-enough dataset legitimately produces
+    neither, and checking them would make a clean run look like it never
+    completed. stage2_pixel_stats_full.csv / stage3_embeddings.npz are
+    written every time regardless of how many images were flagged, so they
+    are the reliable "did this stage complete" signal instead.
+    """
+    out_path = Path(out_dir)
+    expected = [out_path / "stage2_pixel_stats_full.csv"]
+    if not skip_stage3:
+        expected.append(out_path / "stage3_embeddings.npz")
+    return all(p.exists() for p in expected)
+
+
+def load_cached_outlier_outputs(csv_path: str, out_dir: str, skip_stage3: bool) -> tuple:
+    """Reconstruct run_outlier_pipeline's 8-tuple return contract from cached
+    files on disk (see outlier_stage_outputs_exist)."""
+    out_path = Path(out_dir)
+    raw_df = pd.read_csv(csv_path)
+    col_map = {}
+    for col in raw_df.columns:
+        if col.lower() in ("image_id", "img_id", "img_name", "filename", "file_name", "image"):
+            col_map[col] = "image_id"
+        elif col.lower() in ("label", "class", "class_id", "category", "target"):
+            col_map[col] = "label"
+    raw_df = raw_df.rename(columns=col_map)
+
+    # Stage 1's only saved artifact is the REMOVED-images log (it is only
+    # written when at least one image failed integrity); df_clean is cheaply
+    # reconstructed as raw_df minus those ids, with no need to reopen every
+    # image file again.
+    s1_path = out_path / "removed_stage1_integrity.csv"
+    if s1_path.exists():
+        removed_ids = set(pd.read_csv(s1_path)["image_id"].astype(str))
+        df_clean = raw_df[~raw_df["image_id"].astype(str).isin(removed_ids)].reset_index(drop=True)
+    else:
+        df_clean = raw_df.reset_index(drop=True)
+
+    stats_df = pd.read_csv(out_path / "stage2_pixel_stats_full.csv")
+    flagged2_path = out_path / "review_stage2_nonfood_pixelstats.csv"
+    flagged2 = pd.read_csv(flagged2_path) if flagged2_path.exists() else stats_df.iloc[0:0].copy()
+
+    if skip_stage3:
+        feats, image_ids = np.array([]), []
+        global_scores, per_class_scores = np.array([]), np.array([])
+        flagged3 = pd.DataFrame()
+    else:
+        npz = np.load(out_path / "stage3_embeddings.npz", allow_pickle=True)
+        feats = npz["feats"]
+        image_ids = npz["ids"].tolist()
+        global_scores = npz["global_scores"]
+        per_class_scores = npz["per_class_scores"]
+        flagged3_path = out_path / "review_stage3_nonfood_embedding.csv"
+        flagged3 = pd.read_csv(flagged3_path) if flagged3_path.exists() else pd.DataFrame()
+
+    return df_clean, stats_df, flagged2, feats, image_ids, global_scores, per_class_scores, flagged3

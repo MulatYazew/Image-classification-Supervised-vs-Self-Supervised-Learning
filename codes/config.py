@@ -62,14 +62,28 @@ LEARNING_RATE = 5e-4       # v2: lowered from 1e-3; more stable for deep from-sc
 WEIGHT_DECAY  = 1e-4
 LABEL_SMOOTHING = 0.1      # mild smoothing helps with 251 fine-grained classes
 
-# num_workers > 0 can hang on macOS with some DataLoader configs; keep low.
+# num_workers > 0 spawns worker processes; on Apple Silicon (this project's
+# target: MacBook Air M4) that multiprocessing spawn overhead is what causes
+# DataLoader slowdowns/hangs, not a lack of CPU throughput. 0 = load in the
+# main process; keep this the default on Mac. Raise it only on CUDA machines
+# with a fast local disk.
 NUM_WORKERS = 0
 
-#  Custom model 
-# No pretrained backbones are allowed. Choose among the custom architectures
-# defined in model.py — every option is verified < 10 M parameters.
-# Choices: "food251net" (proposed) | "food251net_lite" (baseline)
-MODEL_ARCHITECTURE = "foodnet46"
+#  Idempotency (Apple Silicon / long-pipeline reruns)
+# When False (default), notebook cells that already have their expected
+# output(s) on disk (cleaned manifests, tuning results, checkpoints, ...)
+# print "SKIPPING" and reload them instead of recomputing. Set True to ignore
+# every cache and force a full clean rerun; or just delete the specific
+# output file(s) you want to regenerate for a more targeted rerun.
+FORCE_RECOMPUTE_DATA = False   # outlier pipeline / cleaned manifest / audit report
+FORCE_RETRAIN        = False   # supervised + SSL tuning/training checkpoints
+
+#  Custom model
+# No pretrained backbones are allowed. codes.model.MODEL_REGISTRY holds both
+# custom architectures ("foodnet30": 30-layer residual DWS+SE, "foodnet46":
+# 46-layer MBConv, proposed) — every option is verified < 10 M parameters.
+# The notebook trains and compares BOTH (run_supervised_pipeline per
+# architecture), so there is no single "active" architecture to select here.
 DROPOUT = 0.3
 WIDTH_MULT = 1.0           # global channel multiplier; lower to shrink the model
 
@@ -83,9 +97,15 @@ CLASS_WEIGHT_SCHEME = "sqrt_inv"
 
 #  Hyperparameter tuning
 # Short probe budget per configuration during the search (the winner is then
-# trained to convergence with NUM_EPOCHS / SSL_EPOCHS).
+# trained to convergence with NUM_EPOCHS / SSL_EPOCHS). These are UPPER BOUNDS:
+# TUNE_EARLY_STOP_PATIENCE / SSL_TUNE_EARLY_STOP_PATIENCE let a clearly-
+# plateaued candidate stop before burning the rest of this probe budget. This
+# is a separate, local-to-the-search-loop mechanism from Trainer's own
+# early stopping (PATIENCE below), which only applies to the Phase C full retrain.
 TUNE_PROBE_EPOCHS     = 5
 SSL_TUNE_PROBE_EPOCHS = 10
+TUNE_EARLY_STOP_PATIENCE     = 5
+SSL_TUNE_EARLY_STOP_PATIENCE = 5
 # Search strategy: "grid" (exhaustive), "random" (sample N configs — better
 # than grid once >~2 axes are combined, for the same compute budget), or
 # "successive_halving" (start many configs at a short budget, keep the top
@@ -152,5 +172,5 @@ LOG_PER_CLASS_EVERY = 10
 OUTLIER_MIN_CLASS_REMAINING = 15
 
 #  Early stopping
-PATIENCE  = 12             # v2: increased from 8; improved model needs more time to settle
+PATIENCE  = 12             # epochs without val-loss improvement before stopping Phase C training
 MIN_DELTA = 1e-4
