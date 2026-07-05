@@ -45,14 +45,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import sys
-import os
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from loss_function import NTXentLoss
-from model import BaseModel
-from utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
+from .loss_function import NTXentLoss
+from .model import BaseModel
+from .utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
 
 
 

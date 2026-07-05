@@ -48,16 +48,12 @@ import torch.nn as nn
 from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score
-import sys
-import os
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from .model import build_model, BaseModel
+from .loss_function import build_criterion
+from .data_handler import compute_class_weights, check_single_imbalance_correction
 
-from model import build_model, BaseModel
-from loss_function import build_criterion
-from data_handler import compute_class_weights, check_single_imbalance_correction
-
-from utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
+from .utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
 
 # Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
 # installed, so the module never hard-depends on it.

@@ -110,10 +110,11 @@ def amp_dtype_for(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
         return torch.float16
     if device.type == "mps":
-        # Mirrors get_device()'s dual-import-context handling above: some
-        # callers (hyperparameter_tuning.py, self_supervised.py) import this
-        # module as a bare top-level "utils" via a sys.path hack rather than
-        # as "codes.utils", where a relative import has no parent package.
+        # Mirrors get_device()'s defensive fallback above: every caller in
+        # this package imports via proper relative/package imports (codes.*),
+        # so this relative import always resolves in practice -- the
+        # try/except only guards against this module being executed outside
+        # the codes package (e.g. copied elsewhere without its __init__.py).
         try:
             from . import config as _cfg
         except ImportError:

@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from utils import amp_enabled, amp_dtype_for
+from .utils import amp_enabled, amp_dtype_for
 
 # Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
 # trainer never hard-depends on it.
