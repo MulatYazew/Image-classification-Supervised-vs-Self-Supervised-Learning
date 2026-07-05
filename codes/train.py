@@ -25,6 +25,8 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
+from .utils import amp_enabled, amp_dtype_for
+
 # Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
 # trainer never hard-depends on it.
 try:
@@ -81,9 +83,15 @@ class Trainer:
 
         self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-        # Mixed precision: ~2x faster and ~half the memory on CUDA.
-        self.use_amp = use_amp and device.type == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        # Mixed precision: ~2x faster and ~half the memory on CUDA; autocast
+        # also engages on MPS (measured speedup on this M4 Mac -- see
+        # config.AMP_MPS_DTYPE). GradScaler stays CUDA-only regardless: MPS
+        # doesn't need/support the same overflow-scaling machinery, so only
+        # the autocast context (self.use_amp) extends to MPS, not the scaler.
+        cuda_amp = use_amp and device.type == "cuda"
+        self.use_amp = amp_enabled(use_amp, device)
+        self.amp_dtype = amp_dtype_for(device)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
         # Backward-compatible shorthand: mixup_alpha > 0 with the default
         # mix_method="none" still enables MixUp, so existing call sites that
@@ -153,7 +161,7 @@ class Trainer:
                 if use_mix:
                     mix_fn = self.mixup_batch if self.mix_method == "mixup" else self.cutmix_batch
                     images, y_a, y_b, lam = mix_fn(images, labels)
-                    with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                         outputs = self.model(images)
                         # Mix loss = weighted sum of the two constituent losses.
                         loss = lam * self.criterion(outputs, y_a) + \
@@ -163,7 +171,7 @@ class Trainer:
                     hits = (lam * (pred == y_a).float() +
                             (1.0 - lam) * (pred == y_b).float()).sum().item()
                 else:
-                    with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                         outputs = self.model(images)
                         loss = self.criterion(outputs, labels)
                     hits = (outputs.argmax(1) == labels).sum().item()
@@ -320,7 +328,7 @@ class Trainer:
         preds_or_probs, labels_all = [], []
         for images, labels in loader:
             images = images.to(self.device, non_blocking=True)
-            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 logits = self.model(images)
             if return_probs:
                 out = torch.softmax(logits.float(), dim=1)
@@ -421,8 +429,10 @@ def lr_finder(
     best = float("inf")
     it = 0
 
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    cuda_amp = device.type == "cuda"
+    use_amp = amp_enabled(True, device)
+    amp_dtype = amp_dtype_for(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
     done = False
     while not done:
@@ -435,7 +445,7 @@ def lr_finder(
             _set_lr(optimizer, lr)
             optimizer.zero_grad(set_to_none=True)
             with torch.enable_grad():
-                with torch.autocast(device_type=device.type, enabled=use_amp):
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     loss = criterion(model(images), labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)

@@ -69,6 +69,59 @@ def get_device(prefer: str | None = None) -> torch.device:
     return dev
 
 
+def amp_enabled(use_amp: bool, device: torch.device) -> bool:
+    """
+    True if autocast should engage.
+
+    CUDA: always follows ``use_amp`` (autocast is a clear win there).
+
+    MPS: gated by config.AMP_MPS_ENABLED, default False. MEASURED on a
+    MacBook Air M4 (foodnet46, batch 64, 20-batch/3-repeat harness): FP32
+    ran at 0.658 s/batch vs 0.748-0.749 s/batch for BOTH float16 and
+    bfloat16 autocast -- i.e. autocast was ~14% SLOWER, not faster, on this
+    backend/model, reproduced across two independent FP32 re-checks. The
+    infrastructure (this function + amp_dtype_for) is kept because it's the
+    correct plumbing on CUDA and costs nothing when disabled, but it must
+    NOT be forced on for MPS by default given it measurably regresses this
+    workload -- flip config.AMP_MPS_ENABLED=True to opt in if a future torch
+    version or different model changes this.
+
+    CPU never autocasts.
+    """
+    if device.type == "cuda":
+        return use_amp
+    if device.type == "mps":
+        try:
+            from . import config as _cfg
+        except ImportError:
+            return False
+        return use_amp and getattr(_cfg, "AMP_MPS_ENABLED", False)
+    return False
+
+
+def amp_dtype_for(device: torch.device) -> torch.dtype:
+    """
+    Autocast dtype per backend: float16 on CUDA (paired with a CUDA-only
+    GradScaler for overflow protection). On MPS, config.AMP_MPS_DTYPE picks
+    float16 (default) or bfloat16 -- set from a 1-epoch stability sanity check
+    on this project's from-scratch BatchNorm models (see config.py). Unused
+    (returns float32) when autocast is disabled/CPU.
+    """
+    if device.type == "cuda":
+        return torch.float16
+    if device.type == "mps":
+        # Mirrors get_device()'s dual-import-context handling above: some
+        # callers (hyperparameter_tuning.py, self_supervised.py) import this
+        # module as a bare top-level "utils" via a sys.path hack rather than
+        # as "codes.utils", where a relative import has no parent package.
+        try:
+            from . import config as _cfg
+        except ImportError:
+            return torch.float16
+        return torch.bfloat16 if getattr(_cfg, "AMP_MPS_DTYPE", "float16") == "bfloat16" else torch.float16
+    return torch.float32
+
+
 def create_directories(*paths) -> None:
     """Create directories if they don't already exist."""
     for p in paths:

@@ -62,12 +62,18 @@ LEARNING_RATE = 5e-4       # v2: lowered from 1e-3; more stable for deep from-sc
 WEIGHT_DECAY  = 1e-4
 LABEL_SMOOTHING = 0.1      # mild smoothing helps with 251 fine-grained classes
 
-# num_workers > 0 spawns worker processes; on Apple Silicon (this project's
-# target: MacBook Air M4) that multiprocessing spawn overhead is what causes
-# DataLoader slowdowns/hangs, not a lack of CPU throughput. 0 = load in the
-# main process; keep this the default on Mac. Raise it only on CUDA machines
-# with a fast local disk.
-NUM_WORKERS = 0
+# Measured on this machine (MacBook Air M4, 10 cores, MPS): with
+# cv2.setNumThreads(0) applied in every worker (data_handler.worker_init_fn --
+# without it, cv2's own thread pool fights the DataLoader's worker processes
+# and workers>0 is actually SLOWER/prone to hang), sweeping num_workers over
+# the real training pipeline (foodnet46, batch 64, 20-batch/3-repeat harness)
+# gave: 0->1.09 s/batch, 2->1.05, 4->0.97, 6->0.96, 8->0.95. Gains plateau past
+# 4 (this pipeline is compute-bound on MPS -- pure data loading measured at
+# only ~0.14 s/batch of the ~1.09 s/batch total, so overlapping it with
+# compute can save at most ~13%, which is what was observed). 4 was chosen
+# over 6/8 as the smallest worker count that captures ~90% of the achievable
+# gain; verified with 3 separate fresh-process runs (no hangs).
+NUM_WORKERS = 4
 
 #  Idempotency (Apple Silicon / long-pipeline reruns)
 # When False (default), notebook cells that already have their expected
@@ -96,28 +102,63 @@ USE_WEIGHTED_SAMPLER = False   # pick ONE correction point (sampler XOR loss wei
 CLASS_WEIGHT_SCHEME = "sqrt_inv"
 
 #  Hyperparameter tuning
-# Short probe budget per configuration during the search (the winner is then
-# trained to convergence with NUM_EPOCHS / SSL_EPOCHS). These are UPPER BOUNDS:
 # TUNE_EARLY_STOP_PATIENCE / SSL_TUNE_EARLY_STOP_PATIENCE let a clearly-
-# plateaued candidate stop before burning the rest of this probe budget. This
-# is a separate, local-to-the-search-loop mechanism from Trainer's own
-# early stopping (PATIENCE below), which only applies to the Phase C full retrain.
-TUNE_PROBE_EPOCHS     = 5
-SSL_TUNE_PROBE_EPOCHS = 10
+# plateaued candidate stop before burning its full probe budget. This is a
+# separate, local-to-the-search-loop mechanism from Trainer's own early
+# stopping (PATIENCE below), which only applies to the Phase C full retrain.
 TUNE_EARLY_STOP_PATIENCE     = 5
 SSL_TUNE_EARLY_STOP_PATIENCE = 5
-# Search strategy: "grid" (exhaustive), "random" (sample N configs — better
-# than grid once >~2 axes are combined, for the same compute budget), or
-# "successive_halving" (start many configs at a short budget, keep the top
-# half, double their budget, repeat — cheap-search-then-confirm in one loop).
-TUNE_STRATEGY         = "successive_halving"
-TUNE_N_RANDOM_CONFIGS = 20     # sampled configs when TUNE_STRATEGY != "grid"
+# probe_supervised's per-epoch early-stop CHECK (only engages when
+# TUNE_EARLY_STOP_PATIENCE > 0) samples only this many batches of the
+# Phase A/B tuning validation loader (tune_val_loader -- already a separate,
+# smaller, documented subset from the REAL validation set; see
+# TUNE_SUBSET_IMAGES_PER_CLASS below) as a cheap proxy signal for "has this
+# candidate plateaued", instead of a full validation pass every epoch. The
+# metric actually used to RANK/SELECT configs is still a full tune_val_loader
+# pass, computed ONCE at the end of each candidate's loop (see
+# probe_supervised's docstring) -- this only cuts the redundant PER-EPOCH cost.
+TUNE_EARLY_STOP_CHECK_BATCHES = 10
+
+# TUNE_MODE picks which block below actually drives TUNE_STRATEGY /
+# TUNE_N_RANDOM_CONFIGS / TUNE_PROBE_EPOCHS / SSL_TUNE_PROBE_EPOCHS. This
+# exists because "TUNE_STRATEGY=successive_halving, TUNE_N_RANDOM_CONFIGS=20,
+# TUNE_PROBE_EPOCHS=5" does NOT mean 20 configs x 5 epochs -- successive
+# halving keeps doubling the survivors' epoch budget each round, which comes
+# to ~460 epoch-equivalents for ONE grid phase alone (see
+# hyperparameter_tuning.estimate_successive_halving_epochs, and the
+# "[tune-budget]" line every tune_supervised/tune_ssl call prints before it
+# starts). Re-running a notebook cell with TUNE_MODE="full" left in place can
+# silently kick off a multi-hour search -- "fast_dev" is the default so that
+# doesn't happen by accident; switch to "full" deliberately for the report run.
+TUNE_MODE = "fast_dev"   # "fast_dev" | "full"
+
+if TUNE_MODE == "full":
+    TUNE_STRATEGY         = "successive_halving"
+    TUNE_N_RANDOM_CONFIGS = 20     # sampled configs when TUNE_STRATEGY != "grid"
+    TUNE_PROBE_EPOCHS     = 5
+    SSL_TUNE_PROBE_EPOCHS = 10     # tune_ssl always does an exhaustive grid (no
+                                    # random/successive-halving option there yet)
+elif TUNE_MODE == "fast_dev":
+    TUNE_STRATEGY         = "random"
+    TUNE_N_RANDOM_CONFIGS = 6
+    TUNE_PROBE_EPOCHS     = 2
+    SSL_TUNE_PROBE_EPOCHS = 3
+else:
+    raise ValueError(f"Unknown TUNE_MODE '{TUNE_MODE}'. Choose: fast_dev, full.")
+
 # Rank configs by macro-F1, not accuracy: with ~19:1 class imbalance a config
 # can look fine on accuracy at epoch 5 while ignoring the tail classes.
 TUNE_SELECTION_METRIC = "f1_macro"    # "f1_macro" | "accuracy"
 # Optional documented cap on the SEARCH data only (Phase A/B); Phase C's final
 # confirmation run always uses the full dataset regardless of this value.
 TUNE_SUBSET_IMAGES_PER_CLASS = 100
+
+# Measured sec/batch for the tuning-time estimate printed by tune_supervised /
+# tune_ssl ("[tune-budget]" line) -- foodnet46, batch 64, NUM_WORKERS=4, FP32
+# (MPS autocast measured slower here, see AMP_MPS_ENABLED above), 20-batch/
+# 3-repeat harness. Re-benchmark and update this if the model/hardware/config
+# changes materially; treated as an estimate, not a guarantee.
+BENCHMARKED_SEC_PER_BATCH = 0.66
 
 #  Self-Supervised Learning (pretext) 
 # SSL pretrains the SAME custom backbone on the images WITHOUT labels, then we
@@ -174,3 +215,18 @@ OUTLIER_MIN_CLASS_REMAINING = 15
 #  Early stopping
 PATIENCE  = 12             # epochs without val-loss improvement before stopping Phase C training
 MIN_DELTA = 1e-4
+
+#  Mixed precision (AMP)
+# train.py / hyperparameter_tuning.py / self_supervised.py were previously all
+# hardcoded to CUDA-only autocast; the plumbing to extend it to MPS now
+# exists (codes.utils.amp_enabled / amp_dtype_for), but MPS autocast is OFF
+# by default here because it MEASURED SLOWER, not faster, on this machine
+# (MacBook Air M4): FP32 ran at 0.658 s/batch on foodnet46 (batch 64) vs
+# 0.748-0.749 s/batch for autocast in EITHER float16 or bfloat16 -- ~14%
+# slower, reproduced across repeated runs. GradScaler stays CUDA-only
+# regardless (MPS doesn't need/support the same overflow-scaling machinery).
+# Set AMP_MPS_ENABLED=True to opt back in if a future torch/MPS version (or a
+# different, larger model) changes this -- re-run the benchmark first.
+AMP_MPS_ENABLED = False
+AMP_MPS_DTYPE   = "float16"    # only consulted when AMP_MPS_ENABLED=True; float16 and
+                                # bfloat16 measured identically (~0.748s/batch either way)

@@ -57,7 +57,7 @@ from model import build_model, BaseModel
 from loss_function import build_criterion
 from data_handler import compute_class_weights, check_single_imbalance_correction
 
-from utils import get_device, LocalEarlyStopper
+from utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
 
 # Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
 # installed, so the module never hard-depends on it.
@@ -291,6 +291,7 @@ def probe_supervised(
     use_weighted_sampler: bool = False,
     selection_metric: str = "f1_macro",
     early_stop_patience: int = 0,
+    early_stop_check_batches: int | None = None,
 ) -> tuple[float, BaseModel, float, int]:
     """
     Train ``model_name`` for up to ``probe_epochs`` under ``cfg`` and return
@@ -307,15 +308,28 @@ def probe_supervised(
     ``data_handler.check_single_imbalance_correction`` so a sampler-based run
     can never accidentally double-correct.
 
-    ``early_stop_patience`` > 0 evaluates ``selection_metric`` on ``val_loader``
-    after EVERY epoch (not just once at the end) and stops this candidate as
-    soon as ``epochs_since_improvement >= early_stop_patience`` — a search-loop
-    local early stop, independent of ``Trainer``'s own ``PATIENCE`` (which only
-    governs the Phase C full retrain). 0 (default) disables it and keeps the
-    original single-evaluation-at-the-end behaviour. The returned
-    ``val_accuracy``/``val_f1_macro`` are the values from THIS candidate's best
-    epoch (not necessarily its last), since that is the value the early-stop
-    counter tracked against.
+    Two DIFFERENT validation subsets are in play here, both distinct from the
+    REAL validation set used by Phase C / the final reported metrics:
+      * ``val_loader`` itself is already ``tune_val_loader`` in the notebook
+        -- a documented, capped Phase A/B subset (config.
+        TUNE_SUBSET_IMAGES_PER_CLASS), never the full real val set.
+      * ``early_stop_patience`` > 0 additionally evaluates a cheap PROXY
+        signal every epoch (not just once at the end) — only the first
+        ``early_stop_check_batches`` (config.TUNE_EARLY_STOP_CHECK_BATCHES)
+        batches of ``val_loader``, not a full pass — and stops this candidate
+        once that proxy hasn't improved for ``early_stop_patience`` epochs.
+        This is a search-loop-local mechanism, independent of ``Trainer``'s
+        own ``PATIENCE`` (which only governs the Phase C full retrain).
+    The returned ``val_accuracy``/``val_f1_macro`` (used to RANK/SELECT
+    configs) always come from ONE full ``val_loader`` pass at the end of the
+    loop (whichever epoch it stopped/finished at) — NOT from the cheap
+    per-epoch proxy above, so config ranking is never based on a 10-batch
+    sample. This trades a small amount of accuracy (the reported metric is
+    from the END of the loop, not necessarily the exact best epoch a
+    full-precision per-epoch check would have found) for cutting N-1 of N
+    full validation passes per candidate. 0 (default) disables
+    early_stop_patience entirely and keeps the original
+    single-evaluation-at-the-end behaviour, unaffected by this trade-off.
     """
     model = build_model(
         cfg["model_name"], num_classes=num_classes,
@@ -338,24 +352,31 @@ def probe_supervised(
         gamma=cfg.get("focal_gamma", 2.0), label_smoothing=cfg.get("label_smoothing", 0.0),
     ).to(device)
 
-    # AMP (fp16 + GradScaler) only helps on CUDA, so it stays gated to CUDA; but
-    # key the calls off device.type so they're valid on MPS/CPU too (your friend's
-    # CUDA PC gets mixed precision; your Mac runs full precision — no crash).
-    amp_on = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
+    # Autocast now also engages on MPS (measured speedup on this M4 Mac -- see
+    # config.AMP_MPS_DTYPE); GradScaler stays CUDA-only since MPS doesn't
+    # need/support the same overflow-scaling machinery.
+    cuda_amp = use_amp and device.type == "cuda"
+    amp_on = amp_enabled(use_amp, device)
+    amp_dtype = amp_dtype_for(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
-    def _validate() -> tuple[float, float]:
+    def _validate(max_batches: int | None = None) -> tuple[float, float]:
         # Validation accuracy AND macro-F1 (the selection metric — see
         # config.TUNE_SELECTION_METRIC). Accuracy alone can look fine at epoch 5
         # while the ~19:1 imbalance means tail classes are being ignored entirely.
+        # ``max_batches`` caps this to a cheap proxy pass (the per-epoch
+        # early-stop CHECK only); None (default) is a full pass, used for the
+        # metric actually returned/ranked on — see probe_supervised's docstring.
         model.eval()
         correct, total = 0, 0
         all_preds, all_labels = [], []
+        loader = val_loader if max_batches is None else itertools.islice(val_loader, max_batches)
         with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc="probe val", leave=False, unit="batch"):
+            for images, labels in tqdm(loader, desc="probe val", leave=False, unit="batch",
+                                       total=max_batches):
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                with torch.amp.autocast(device.type, enabled=amp_on):
+                with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=amp_on):
                     preds = model(images).argmax(1)
                 correct += (preds.cpu() == labels.cpu()).sum().item()
                 total += labels.size(0)
@@ -368,7 +389,6 @@ def probe_supervised(
         return acc, f1_macro
 
     stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 else None
-    best_val_acc, best_val_f1_macro = 0.0, 0.0
     epochs_run = 0
 
     for epoch in range(1, probe_epochs + 1):
@@ -380,7 +400,7 @@ def probe_supervised(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device.type, enabled=amp_on):
+            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=amp_on):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
@@ -399,19 +419,28 @@ def probe_supervised(
         epochs_run = epoch
 
         if stopper is not None:
-            val_acc, val_f1_macro = _validate()
-            current = val_f1_macro if selection_metric == "f1_macro" else val_acc
-            improved = stopper.best is None or current > stopper.best + stopper.min_delta
+            # Cheap proxy check ONLY -- capped to early_stop_check_batches,
+            # never a full validation pass (see docstring).
+            check_batches = early_stop_check_batches
+            if check_batches is None:
+                try:
+                    from . import config as _cfg
+                    check_batches = getattr(_cfg, "TUNE_EARLY_STOP_CHECK_BATCHES", 10)
+                except ImportError:
+                    check_batches = 10
+            proxy_acc, proxy_f1_macro = _validate(max_batches=check_batches)
+            current = proxy_f1_macro if selection_metric == "f1_macro" else proxy_acc
             stop_now = stopper.update(current)
-            if improved:
-                best_val_acc, best_val_f1_macro = val_acc, val_f1_macro
             if stop_now:
                 print(f"[tune] search early-stop at epoch {epoch}/{probe_epochs} "
-                      f"(no {selection_metric} improvement for {early_stop_patience} epochs)")
+                      f"(no {selection_metric} improvement for {early_stop_patience} epochs, "
+                      f"proxy check over {check_batches} batches)")
                 break
 
-    if stopper is None:
-        best_val_acc, best_val_f1_macro = _validate()
+    # Reported/ranked metric: ALWAYS one full val_loader pass at the END of
+    # the loop -- not the cheap per-epoch proxy above -- so config
+    # ranking is never based on a small batch sample.
+    best_val_acc, best_val_f1_macro = _validate(max_batches=None)
 
     return best_val_acc, model, best_val_f1_macro, epochs_run
 
@@ -556,6 +585,70 @@ def grid_search_over_configs(
 
 #  Successive halving
 
+def estimate_successive_halving_epochs(n_configs: int, initial_epochs: int,
+                                       reduction_factor: int = 2, min_configs: int = 1) -> int:
+    """
+    Total epoch-equivalents ``successive_halving_search`` will actually run --
+    the exact same round-by-round arithmetic it uses internally (keep the top
+    ``1/reduction_factor`` survivors, double their epoch budget, repeat until
+    ``min_configs`` remain), computed WITHOUT running anything.
+
+    This is what makes "TUNE_STRATEGY=successive_halving, N_RANDOM_CONFIGS=20,
+    PROBE_EPOCHS=5" NOT mean 20*5=100 epochs: e.g. n_configs=20,
+    initial_epochs=5, reduction_factor=2 comes to 460 (100 + 100 + 100 + 80 +
+    80 across 5 rounds), not 100. Doesn't model <10M-param rejections or
+    search-loop early stopping (config.TUNE_EARLY_STOP_PATIENCE) -- both can
+    only REDUCE the real total below this, so treat it as an upper bound.
+    """
+    remaining = n_configs
+    epochs = initial_epochs
+    total = 0
+    while True:
+        total += remaining * epochs
+        keep_n = max(min_configs, remaining // reduction_factor)
+        if keep_n >= remaining or remaining <= min_configs:
+            break
+        remaining = keep_n
+        epochs *= reduction_factor
+    return total
+
+
+def print_tuning_budget(strategy: str, n_configs: int, probe_epochs: int,
+                        reduction_factor: int = 2, min_configs: int = 1,
+                        batches_per_epoch: int | None = None) -> int:
+    """
+    Print a one-line "[tune-budget]" summary BEFORE a search starts: strategy,
+    total configs, total epoch-equivalents, and an estimated wall-clock time
+    (using config.BENCHMARKED_SEC_PER_BATCH and ``batches_per_epoch``, when
+    given). Returns the epoch-equivalent count so callers can reuse it.
+
+    Exists so "I didn't realize probe_epochs=5 meant hours of compute" can't
+    happen silently again -- every tune_supervised/tune_ssl call prints this
+    regardless of strategy.
+    """
+    if strategy == "successive_halving":
+        total_epochs = estimate_successive_halving_epochs(
+            n_configs, probe_epochs, reduction_factor, min_configs)
+        detail = "successive-halving (budget doubles each round, see estimate_successive_halving_epochs)"
+    else:
+        total_epochs = n_configs * probe_epochs
+        detail = strategy
+
+    msg = (f"[tune-budget] strategy={strategy} | configs={n_configs} | "
+          f"probe_epochs={probe_epochs} | ~{total_epochs} total epoch-equivalents ({detail})")
+    try:
+        from . import config as _cfg
+    except ImportError:
+        _cfg = None
+    sec_per_batch = getattr(_cfg, "BENCHMARKED_SEC_PER_BATCH", None) if _cfg else None
+    if sec_per_batch and batches_per_epoch:
+        from .utils import format_time
+        est_seconds = total_epochs * batches_per_epoch * sec_per_batch
+        msg += f" | est. wall-clock ~{format_time(est_seconds)} @ {sec_per_batch:.2f}s/batch"
+    print(msg)
+    return total_epochs
+
+
 def successive_halving_search(
     configs: list[dict],
     probe_fn: Callable[..., tuple[float, BaseModel, float, int]],
@@ -580,6 +673,12 @@ def successive_halving_search(
     reflects the LAST round's survivors at their final budget; combine with
     the earlier rounds' printed output if you want the full elimination history).
     """
+    if verbose:
+        train_loader = probe_kwargs.get("train_loader")
+        batches_per_epoch = len(train_loader) if train_loader is not None else None
+        print_tuning_budget("successive_halving", len(configs), initial_epochs,
+                           reduction_factor, min_configs, batches_per_epoch)
+
     remaining = list(configs)
     epochs = initial_epochs
     round_num = 1
@@ -715,19 +814,25 @@ def tune_supervised(
         num_classes=num_classes, use_weighted_sampler=use_weighted_sampler,
         early_stop_patience=early_stop_patience,
     )
+    batches_per_epoch = len(train_loader)
 
     if strategy == "grid":
+        n_configs = len(list(iter_grid(grid)))
+        print_tuning_budget("grid", n_configs, probe_epochs, batches_per_epoch=batches_per_epoch)
         best, results = grid_search(
             grid, probe_supervised, device, selection_metric=selection_metric,
             data_subset=data_subset, probe_epochs=probe_epochs, **probe_kwargs,
         )
     elif strategy == "random":
         configs = sample_random_configs(grid, n_random_configs, seed=seed)
+        print_tuning_budget("random", len(configs), probe_epochs, batches_per_epoch=batches_per_epoch)
         best, results = grid_search_over_configs(
             configs, probe_supervised, device, selection_metric=selection_metric,
             data_subset=data_subset, probe_epochs=probe_epochs, **probe_kwargs,
         )
     elif strategy == "successive_halving":
+        # print_tuning_budget is called INSIDE successive_halving_search
+        # (needs to see initial_epochs/reduction_factor there, not here).
         configs = sample_random_configs(grid, n_random_configs, seed=seed)
         best, results = successive_halving_search(
             configs, probe_supervised, device, initial_epochs=probe_epochs,
@@ -884,7 +989,12 @@ def tune_ssl(
     device = device or get_device()
     grid = grid or default_ssl_grid()
     configs = deduplicate_ssl_configs(list(iter_grid(grid)), method)
-    print(f"[tune-ssl:{method}] {len(configs)} configs to probe.")
+    # No wall-clock estimate here: config.BENCHMARKED_SEC_PER_BATCH was
+    # measured on the supervised probe pipeline, and SSL's per-batch cost
+    # (two augmented views + NT-Xent, or 4x rotation expansion) isn't the
+    # same shape -- reporting a number from the wrong pipeline would be
+    # actively misleading, so this only prints the epoch-equivalent count.
+    print_tuning_budget(f"grid[ssl:{method}]", len(configs), probe_epochs)
 
     best, results = grid_search_over_configs(
         configs, probe_ssl, device, selection_metric=selection_metric,

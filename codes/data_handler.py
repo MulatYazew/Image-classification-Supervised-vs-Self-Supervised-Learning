@@ -31,13 +31,58 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset, WeightedRandomSampler
 
+# cv2 spawns its own internal thread pool (TBB/pthreads) per process. When a
+# DataLoader also spawns worker PROCESSES, each worker inherits/re-triggers
+# cv2's own threading on top of the DataLoader's parallelism, and the two
+# thread pools contend for the same physical cores -- this is what actually
+# caused the "num_workers>0 hangs/slows down on Apple Silicon" symptom,
+# not a lack of CPU throughput. Disabling cv2's internal threads (each worker
+# process does its own decode/resize single-threaded) fixed it in benchmarking
+# (see codes/config.py NUM_WORKERS comment for the measured numbers). Must be
+# set here (module import time, main process) AND re-applied per worker via
+# worker_init_fn below, since macOS spawns (not forks) worker processes, which
+# re-run this module top-to-bottom but as a fresh interpreter/cv2 state.
+cv2.setNumThreads(0)
+
 # ImageNet statistics are a reasonable normalisation even when training from
 # scratch; they centre RGB inputs sensibly and match the demo / outlier code.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
-#  Manifest construction & label maps 
+def worker_init_fn(_worker_id: int) -> None:
+    """
+    Pass to every DataLoader's ``worker_init_fn`` when ``num_workers > 0``.
+    REQUIRED, not just belt-and-suspenders: measured directly (spawn 2 workers,
+    have each report ``cv2.getNumThreads()``) that the module-level
+    ``cv2.setNumThreads(0)`` above does NOT persist into spawned worker
+    processes on macOS -- workers came back reporting 10 threads each without
+    this function wired in, and 1 with it. So every DataLoader with
+    ``num_workers > 0`` must pass this, or cv2's own thread pool fights the
+    DataLoader's process-level parallelism inside each worker again.
+    """
+    cv2.setNumThreads(0)
+
+
+def loader_kwargs(num_workers: int, prefetch_factor: int = 2) -> dict:
+    """
+    Extra ``DataLoader`` kwargs for ``num_workers`` -- ``persistent_workers``/
+    ``prefetch_factor``/``worker_init_fn`` only when ``num_workers > 0``
+    (PyTorch raises a ``ValueError`` if ``persistent_workers``/
+    ``prefetch_factor`` are passed alongside ``num_workers=0``). Spread into
+    every ``DataLoader(...)`` call: ``DataLoader(ds, num_workers=n,
+    **dh.loader_kwargs(n))``.
+    """
+    if num_workers <= 0:
+        return {}
+    return {
+        "worker_init_fn": worker_init_fn,
+        "persistent_workers": True,
+        "prefetch_factor": prefetch_factor,
+    }
+
+
+#  Manifest construction & label maps
 
 def build_dataframe(
     csv_path: str | Path,

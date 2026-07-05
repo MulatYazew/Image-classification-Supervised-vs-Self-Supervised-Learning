@@ -52,7 +52,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from loss_function import NTXentLoss
 from model import BaseModel
-from utils import get_device, LocalEarlyStopper
+from utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
 
 
 
@@ -129,9 +129,13 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
     optimizer = AdamW(list(backbone.parameters()) + list(proj.parameters()),
                       lr=scaled_lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    # AMP only helps on CUDA, so keep it gated to CUDA — but key the scaler
-    amp_on = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
+    # Autocast now also engages on MPS (measured speedup on this M4 Mac -- see
+    # config.AMP_MPS_DTYPE); GradScaler stays CUDA-only since MPS doesn't
+    # need/support the same overflow-scaling machinery.
+    cuda_amp = use_amp and device.type == "cuda"
+    amp_on = amp_enabled(use_amp, device)
+    amp_dtype = amp_dtype_for(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
     history: dict[str, list[float]] = {"ssl_loss": []}
     stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 and eval_fn is not None else None
@@ -142,7 +146,7 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
         for view1, view2 in ssl_loader:
             view1, view2 = view1.to(device, non_blocking=True), view2.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device.type, enabled=amp_on):
+            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=amp_on):
                 z1 = proj(backbone.forward_features(view1))   # project both views …
                 z2 = proj(backbone.forward_features(view2))
                 loss = criterion(z1, z2)                       # … and contrast them
@@ -212,8 +216,10 @@ def pretrain_rotation(
     optimizer = AdamW(list(backbone.parameters()) + list(rot_head.parameters()),
                       lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    amp_on = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
+    cuda_amp = use_amp and device.type == "cuda"
+    amp_on = amp_enabled(use_amp, device)
+    amp_dtype = amp_dtype_for(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
     history: dict[str, list[float]] = {"ssl_loss": [], "ssl_acc": []}
     stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 and eval_fn is not None else None
@@ -236,7 +242,7 @@ def pretrain_rotation(
             y = torch.cat(targets, dim=0)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device.type, enabled=amp_on):
+            with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=amp_on):
                 logits = rot_head(backbone.forward_features(x))
                 loss = criterion(logits, y)
             scaler.scale(loss).backward()
