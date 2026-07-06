@@ -20,6 +20,8 @@ The defaults below are tuned for Apple Silicon (MPS) but fall back to CUDA/CPU.
 
 from pathlib import Path
 
+from . import utils as _utils
+
 #  Reproducibility 
 SEED = 42
 
@@ -62,18 +64,34 @@ LEARNING_RATE = 5e-4       # v2: lowered from 1e-3; more stable for deep from-sc
 WEIGHT_DECAY  = 1e-4
 LABEL_SMOOTHING = 0.1      # mild smoothing helps with 251 fine-grained classes
 
-# Measured on this machine (MacBook Air M4, 10 cores, MPS): with
-# cv2.setNumThreads(0) applied in every worker (data_handler.worker_init_fn --
-# without it, cv2's own thread pool fights the DataLoader's worker processes
-# and workers>0 is actually SLOWER/prone to hang), sweeping num_workers over
-# the real training pipeline (foodnet46, batch 64, 20-batch/3-repeat harness)
-# gave: 0->1.09 s/batch, 2->1.05, 4->0.97, 6->0.96, 8->0.95. Gains plateau past
-# 4 (this pipeline is compute-bound on MPS -- pure data loading measured at
-# only ~0.14 s/batch of the ~1.09 s/batch total, so overlapping it with
-# compute can save at most ~13%, which is what was observed). 4 was chosen
-# over 6/8 as the smallest worker count that captures ~90% of the achievable
-# gain; verified with 3 separate fresh-process runs (no hangs).
-NUM_WORKERS = 4
+# NUM_WORKERS is now resolved automatically per-device (utils.select_num_workers),
+# called right here at import time -- right after get_device(), before any
+# DataLoader is built -- so there is no manual benchmarking step on either
+# machine:
+#   * MPS  -> 0 immediately. Measured on this machine (MacBook Air M4, 10
+#     cores): with cv2.setNumThreads(0) applied in every worker
+#     (data_handler.worker_init_fn -- without it, cv2's own thread pool
+#     fights the DataLoader's worker processes and workers>0 is actually
+#     SLOWER/prone to hang), sweeping num_workers over the real training
+#     pipeline (foodnet46, batch 64, 20-batch/3-repeat harness) gave:
+#     0->1.09 s/batch, 2->1.05, 4->0.97, 6->0.96, 8->0.95. Gains plateau past
+#     4 (this pipeline is compute-bound on MPS -- pure data loading measured
+#     at only ~0.14 s/batch of the ~1.09 s/batch total, so overlapping it
+#     with compute can save at most ~13%, which is what was observed) -- not
+#     worth a benchmark, so MPS short-circuits straight to 0.
+#   * CUDA -> auto-benchmarked candidates [4, 6, 8, 12] on THIS machine's real
+#     training pipeline the FIRST time it runs there, then cached to
+#     results/num_workers_benchmark.json keyed by the GPU name (every run
+#     after that just loads the cached value). Prefers 6 or 8 unless another
+#     candidate wins by >15%. Pass force_rebenchmark=True to
+#     utils.select_num_workers to ignore the cache (e.g. after a driver/
+#     hardware change).
+#   * CPU  -> min(NUM_WORKERS_FALLBACK, os.cpu_count()), no benchmark.
+NUM_WORKERS_FALLBACK = 4   # historical MPS-benchmarked value; also the CPU cap
+_DEVICE_RESOLVED = _utils.get_device(DEVICE)
+NUM_WORKERS = _utils.select_num_workers(
+    _DEVICE_RESOLVED, results_dir=RESULTS_DIR, cpu_fallback=NUM_WORKERS_FALLBACK,
+)
 
 #  Idempotency (Apple Silicon / long-pipeline reruns)
 # When False (default), notebook cells that already have their expected
@@ -156,9 +174,24 @@ TUNE_SUBSET_IMAGES_PER_CLASS = 100
 # Measured sec/batch for the tuning-time estimate printed by tune_supervised /
 # tune_ssl ("[tune-budget]" line) -- foodnet46, batch 64, NUM_WORKERS=4, FP32
 # (MPS autocast measured slower here, see AMP_MPS_ENABLED above), 20-batch/
-# 3-repeat harness. Re-benchmark and update this if the model/hardware/config
-# changes materially; treated as an estimate, not a guarantee.
+# 3-repeat harness. This is the MacBook Air M4 (MPS) default; treated as an
+# estimate, not a guarantee.
 BENCHMARKED_SEC_PER_BATCH = 0.66
+
+# On CUDA, override the Mac-only default above with THIS machine's own
+# measurement from the NUM_WORKERS auto-benchmark (same harness: foodnet46,
+# batch 64, 20-batch/3-repeat, just at the num_workers value actually chosen
+# for this GPU) -- so the "[tune-budget]" wall-clock ETA reflects real
+# Legion-class hardware instead of the Mac's number. Silently keeps the Mac
+# default if the benchmark cache doesn't have an entry for some reason (e.g.
+# force_rebenchmark hasn't run yet); it will pick up the real number on the
+# very next run, once NUM_WORKERS above has cached it.
+if _DEVICE_RESOLVED.type == "cuda":
+    _cuda_benchmark = _utils.load_num_workers_benchmark(_DEVICE_RESOLVED, results_dir=RESULTS_DIR)
+    if _cuda_benchmark is not None:
+        _measured = _cuda_benchmark.get("sec_per_batch", {}).get(str(NUM_WORKERS))
+        if _measured is not None:
+            BENCHMARKED_SEC_PER_BATCH = _measured
 
 #  Self-Supervised Learning (pretext) 
 # SSL pretrains the SAME custom backbone on the images WITHOUT labels, then we
