@@ -48,7 +48,6 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 from tqdm import tqdm
-from typing import Optional, List
 
 #  colours for plots
 BG, PANEL, ACCENT, FLAG, LINE, SPINE = "#1a1a2e", "#12122a", "#7b7baa", "#ff4444", "#ffcc00", "#444466"
@@ -243,7 +242,7 @@ def image_integrity_audit(
 
 
 
-def pixel_stats(path: str) -> Optional[dict]:
+def pixel_stats(path: str) -> dict | None:
     """Compute a compact set of pixel-level statistics for a single image.
 
     All statistics are designed to be cheap to compute (no GPU, no deep
@@ -813,7 +812,7 @@ def detect_nonfood_embedding_outliers(
 
 
 
-def load_image_safe(path: str, size: int = 300) -> Optional[np.ndarray]:
+def load_image_safe(path: str, size: int = 300) -> np.ndarray | None:
     """Load a single image from disk and resize it to fit within *size* pixels
     on its longest dimension, returning a uint8 RGB numpy array.
 
@@ -849,22 +848,25 @@ def visualize_flagged_images(flagged_df, img_dir, title="Flagged images",
 
     Border colours encode confidence level, making the most suspicious
     images immediately identifiable at a glance:
-      - **Red**   (``FLAG``)  : high confidence — 3+ standard-bound failures
-                                OR an EXTREME single-stat violation.
+      - **Red**   (``FLAG``)  : high confidence — 3+ standard-bound failures,
+                                an EXTREME single-stat violation, OR a Stage 1
+                                integrity failure (always certain, not
+                                confidence-scored).
       - **Yellow** (``LINE``) : moderate confidence — exactly 2 failures.
       - **Blue**  (``#44aaff``): low confidence — 0–1 failure (flagged by
                                  z-score, unique-colour count, or embedding).
 
     Each cell also displays the class label and the first 50 characters of
     the most informative reason string (``fail_reasons`` for Stage 2,
-    ``anomaly_score_global`` for Stage 3).
+    ``reason`` for Stage 1, ``anomaly_score_global`` for Stage 3).
 
     Parameters
     ----------
     flagged_df : pd.DataFrame
-        Output of ``detect_nonfood_pixel_outliers`` or
-        ``detect_nonfood_embedding_outliers``; must contain ``image_id``
-        and ``label`` columns.
+        Output of ``detect_nonfood_pixel_outliers``,
+        ``detect_nonfood_embedding_outliers``, or the Stage 1
+        ``removed_stage1_integrity.csv`` (``image_id``, ``label``, ``reason``
+        columns); must contain ``image_id`` and ``label``.
     img_dir : str
         Root directory for image files.
     title : str
@@ -876,8 +878,8 @@ def visualize_flagged_images(flagged_df, img_dir, title="Flagged images",
     cols : int
         Number of grid columns (default 8).
     save_path : str or None
-        If provided, the figure is saved to this path at 120 dpi instead of
-        being displayed interactively.
+        If provided, the figure is also saved to this path at 120 dpi
+        (always displayed inline either way).
     """
     if flagged_df.empty:
         print("Nothing to plot - dataframe is empty.")
@@ -901,16 +903,23 @@ def visualize_flagged_images(flagged_df, img_dir, title="Flagged images",
         else:
             ax.text(0.5, 0.5, "load\nerror", ha="center", va="center", fontsize=6, color="salmon", transform=ax.transAxes)
 
-        # Colour-code the subplot border by confidence level.
-        n_fails = row.get("n_fails", 1)
-        reasons = str(row.get("fail_reasons", ""))
-        border = FLAG if (n_fails >= 3 or "EXTREME" in reasons) else (LINE if n_fails == 2 else "#44aaff")
+        # Colour-code the subplot border by confidence level. Stage 1 rows
+        # (identified by a "reason" column, no "n_fails") are unconditional
+        # integrity failures -- not confidence-scored like Stage 2/3 -- so
+        # they always get the most severe border rather than defaulting to
+        # low-confidence blue.
+        if "n_fails" not in row.index and "reason" in row.index:
+            border = FLAG
+        else:
+            n_fails = row.get("n_fails", 1)
+            reasons = str(row.get("fail_reasons", ""))
+            border = FLAG if (n_fails >= 3 or "EXTREME" in reasons) else (LINE if n_fails == 2 else "#44aaff")
         for sp in ax.spines.values():
             sp.set_edgecolor(border); sp.set_linewidth(2)
 
         # Show the most informative reason string as the subplot title.
         reason = ""
-        for col in ("fail_reasons", "anomaly_score_global"):
+        for col in ("fail_reasons", "reason", "anomaly_score_global"):
             if col in row.index and pd.notna(row[col]):
                 reason = str(row[col])[:50]
                 break
@@ -925,8 +934,7 @@ def visualize_flagged_images(flagged_df, img_dir, title="Flagged images",
     if save_path:
         plt.savefig(save_path, bbox_inches="tight", dpi=120, facecolor=fig.get_facecolor())
         print(f"  -> saved grid: {save_path}")
-    else:
-        plt.show()
+    plt.show()
     plt.close()
 
 
@@ -947,7 +955,8 @@ def plot_before_after_class_counts(raw_df, final_df, num_classes: int = 251,
     num_classes : int
         Total number of classes (251, fixed by the spec).
     save_path : str or None
-        If provided, the figure is saved here instead of only being shown.
+        If provided, the figure is also saved here (always displayed inline
+        either way).
     """
     idx = range(num_classes)
     raw_counts = raw_df["label"].value_counts().reindex(idx, fill_value=0)
@@ -996,8 +1005,8 @@ def visualize_outlier_decisions(stats_df, flagged_df, label, save_path=None) -> 
     label : int or str
         The class label to visualise; only rows with this label are plotted.
     save_path : str or None
-        If provided, the figure is saved here instead of being shown
-        interactively.
+        If provided, the figure is also saved here (always displayed
+        inline either way).
     """
     class_stats = stats_df[stats_df["label"] == label]
     class_flagged = flagged_df[flagged_df["label"] == label] if not flagged_df.empty else pd.DataFrame()
@@ -1011,7 +1020,7 @@ def visualize_outlier_decisions(stats_df, flagged_df, label, save_path=None) -> 
     if len(stat_cols) == 1:
         axes = [axes]   # ensure axes is always iterable
 
-    for ax, col in zip(axes, stat_cols):
+    for ax, col in zip(axes, stat_cols, strict=True):
         ax.set_facecolor(PANEL)
         lo, hi = FOOD_STATS_BOUNDS.get(col, (None, None))
 
@@ -1039,8 +1048,7 @@ def visualize_outlier_decisions(stats_df, flagged_df, label, save_path=None) -> 
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, bbox_inches="tight", dpi=120, facecolor=fig.get_facecolor())
-    else:
-        plt.show()
+    plt.show()
     plt.close()
 
 
@@ -1068,8 +1076,8 @@ def plot_anomaly_score_distribution(scores, score_thr=-0.12, title="Anomaly scor
     title : str
         Title displayed above the histogram.
     save_path : str or None
-        If provided, the figure is saved here instead of being shown
-        interactively.
+        If provided, the figure is also saved here (always displayed
+        inline either way).
     """
     fig, ax = plt.subplots(figsize=(11, 4), facecolor=BG)
     ax.set_facecolor(PANEL)
@@ -1090,8 +1098,7 @@ def plot_anomaly_score_distribution(scores, score_thr=-0.12, title="Anomaly scor
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, bbox_inches="tight", dpi=120, facecolor=fig.get_facecolor())
-    else:
-        plt.show()
+    plt.show()
     plt.close()
 
 
@@ -1109,7 +1116,7 @@ def plot_anomaly_score_distribution(scores, score_thr=-0.12, title="Anomaly scor
 # them rather than crashing, so partial decisions are also supported.
 
 
-def apply_review_decisions(df: pd.DataFrame, remove_csv_paths: List[str], output_csv: str = "train_labels_clean.csv") -> pd.DataFrame:
+def apply_review_decisions(df: pd.DataFrame, remove_csv_paths: list[str], output_csv: str = "train_labels_clean.csv") -> pd.DataFrame:
     """Remove reviewer-confirmed outliers from the dataset manifest and write
     the cleaned result to a new CSV.
 
@@ -1177,7 +1184,7 @@ def audit_summary_report(
     stage1_df: pd.DataFrame,
     flagged2_df: pd.DataFrame,
     flagged3_df: pd.DataFrame,
-    final_df: Optional[pd.DataFrame] = None,
+    final_df: pd.DataFrame | None = None,
     num_classes: int = 251,
     out_dir: str = ".",
     min_remaining: int = 15,

@@ -114,7 +114,7 @@ class Evaluator:
         representative validation split).
         """
         if tail_classes is None:
-            n_tail = max(1, int(round(len(per_class_df) * tail_frac)))
+            n_tail = max(1, round(len(per_class_df) * tail_frac))
             tail_classes = set(
                 per_class_df.sort_values("support", kind="mergesort")["label"].head(n_tail)
             )
@@ -187,7 +187,7 @@ class Evaluator:
 
 #  SL vs SSL comparison 
 
-def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> "pd.DataFrame":  # noqa: F821
+def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> pd.DataFrame:
     """
     Build the headline SL-vs-SSL comparison table for the report.
 
@@ -214,7 +214,7 @@ def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> "pd.DataFrame":  #
 
 def plot_training_curves(history: dict, save_path: str | None = None) -> None:
     """Plot train/val loss and accuracy curves from a Trainer history dict."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    _fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.plot(history["train_loss"], label="train")
     ax1.plot(history["val_loss"], label="val")
     ax1.set_title("Loss"); ax1.set_xlabel("epoch"); ax1.legend()
@@ -241,7 +241,7 @@ def plot_ssl_curves(history: dict, method: str = "", save_path: str | None = Non
     ``plot_training_curves`` on a differently-shaped dict.
     """
     has_acc = bool(history.get("ssl_acc"))
-    fig, axes = plt.subplots(1, 2 if has_acc else 1, figsize=(14, 5) if has_acc else (7, 5))
+    _fig, axes = plt.subplots(1, 2 if has_acc else 1, figsize=(14, 5) if has_acc else (7, 5))
     ax1 = axes[0] if has_acc else axes
     ax1.plot(history["ssl_loss"], label="ssl_loss")
     ax1.set_title(f"{method} pretext loss".strip() or "SSL pretext loss")

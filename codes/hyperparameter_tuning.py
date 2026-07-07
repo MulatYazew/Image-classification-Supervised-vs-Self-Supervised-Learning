@@ -39,7 +39,7 @@ from __future__ import annotations
 import itertools
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -53,7 +53,7 @@ from .model import build_model, BaseModel
 from .loss_function import build_criterion
 from .data_handler import compute_class_weights, check_single_imbalance_correction
 
-from .utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
+from .utils import get_device, LocalEarlyStopper, make_amp_context
 
 # Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
 # installed, so the module never hard-depends on it.
@@ -201,7 +201,7 @@ def iter_grid(grid: dict[str, list]) -> Iterable[dict]:
     """Yield every combination of the grid as a config dict (Cartesian product)."""
     keys = list(grid.keys())
     for values in itertools.product(*(grid[k] for k in keys)):
-        yield dict(zip(keys, values))
+        yield dict(zip(keys, values, strict=True))
 
 
 def sample_random_configs(grid: dict[str, list], n: int, seed: int = 42) -> list[dict]:
@@ -351,10 +351,7 @@ def probe_supervised(
     # Autocast now also engages on MPS (measured speedup on this M4 Mac -- see
     # config.AMP_MPS_DTYPE); GradScaler stays CUDA-only since MPS doesn't
     # need/support the same overflow-scaling machinery.
-    cuda_amp = use_amp and device.type == "cuda"
-    amp_on = amp_enabled(use_amp, device)
-    amp_dtype = amp_dtype_for(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+    amp_on, amp_dtype, scaler = make_amp_context(use_amp, device)
 
     def _validate(max_batches: int | None = None) -> tuple[float, float]:
         # Validation accuracy AND macro-F1 (the selection metric — see

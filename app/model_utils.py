@@ -47,26 +47,13 @@ def _require(path: Path, what: str) -> Path:
 
 
 def load_class_names(num_classes: int = 251) -> dict[int, str]:
-    """id -> human-readable food name from dataset/class_list.txt ('<id> <name>'
-    per line). Falls back to 'class_<id>' for any id missing from the file
-    (including when the file itself is absent), so the app never crashes over
-    a display label.
+    """id -> human-readable food name from dataset/class_list.txt, via the
+    same codes.data_handler.load_class_names the training notebook uses (so
+    the app can never drift from the training-time name mapping). Falls back
+    to 'class_<id>' for any id missing from the file (including when the file
+    itself is absent), so the app never crashes over a display label.
     """
-    path = PROJECT_ROOT / "dataset" / "class_list.txt"
-    names = {i: f"class_{i}" for i in range(num_classes)}
-    if path.exists():
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            idx_str, _, name = line.partition(" ")
-            try:
-                idx = int(idx_str)
-            except ValueError:
-                continue
-            if 0 <= idx < num_classes:
-                names[idx] = name
-    return names
+    return dh.load_class_names(num_classes=num_classes, class_list_path=C.CLASS_LIST_PATH)
 
 
 def load_supervised_model(device: torch.device):

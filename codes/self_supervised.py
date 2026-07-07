@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -48,7 +48,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from .loss_function import NTXentLoss
 from .model import BaseModel
-from .utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
+from .utils import get_device, LocalEarlyStopper, make_amp_context
 
 
 
@@ -82,7 +82,7 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
                     weight_decay: float = 1e-4,temperature: float = 0.5, projection_dim: int = 128,
                     batch_size_ref: int = 256, use_amp: bool = True, save_path: str | Path | None = None,
                     early_stop_patience: int = 0,
-                    eval_fn: Optional[Callable[[], float]] = None) -> dict[str, list[float]]:
+                    eval_fn: Callable[[], float] | None = None) -> dict[str, list[float]]:
     """
     Contrastively pretrain ``backbone.forward_features`` with NT-Xent.
 
@@ -128,10 +128,7 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
     # Autocast now also engages on MPS (measured speedup on this M4 Mac -- see
     # config.AMP_MPS_DTYPE); GradScaler stays CUDA-only since MPS doesn't
     # need/support the same overflow-scaling machinery.
-    cuda_amp = use_amp and device.type == "cuda"
-    amp_on = amp_enabled(use_amp, device)
-    amp_dtype = amp_dtype_for(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+    amp_on, amp_dtype, scaler = make_amp_context(use_amp, device)
 
     history: dict[str, list[float]] = {"ssl_loss": []}
     stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 and eval_fn is not None else None
@@ -189,7 +186,7 @@ def pretrain_rotation(
     max_rot_batch: int = 256,
     save_path: str | Path | None = None,
     early_stop_patience: int = 0,
-    eval_fn: Optional[Callable[[], float]] = None,
+    eval_fn: Callable[[], float] | None = None,
 ) -> dict[str, list[float]]:
     """
     Rotation-prediction pretext (Gidaris et al., 2018).
@@ -212,10 +209,7 @@ def pretrain_rotation(
     optimizer = AdamW(list(backbone.parameters()) + list(rot_head.parameters()),
                       lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    cuda_amp = use_amp and device.type == "cuda"
-    amp_on = amp_enabled(use_amp, device)
-    amp_dtype = amp_dtype_for(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+    amp_on, amp_dtype, scaler = make_amp_context(use_amp, device)
 
     history: dict[str, list[float]] = {"ssl_loss": [], "ssl_acc": []}
     stopper = LocalEarlyStopper(early_stop_patience) if early_stop_patience > 0 and eval_fn is not None else None

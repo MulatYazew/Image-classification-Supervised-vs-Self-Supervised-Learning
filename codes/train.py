@@ -17,15 +17,14 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 
-from .utils import amp_enabled, amp_dtype_for
+from .utils import make_amp_context
 
 # Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
 # trainer never hard-depends on it.
@@ -64,10 +63,10 @@ class Trainer:
         self,
         model: nn.Module,
         device: torch.device,
-        criterion: Optional[nn.Module] = None,
+        criterion: nn.Module | None = None,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
-        class_weights: Optional[torch.Tensor] = None,
+        class_weights: torch.Tensor | None = None,
         use_amp: bool = True,
         mix_method: str = "none",
         mixup_alpha: float = 0.0,
@@ -88,10 +87,7 @@ class Trainer:
         # config.AMP_MPS_DTYPE). GradScaler stays CUDA-only regardless: MPS
         # doesn't need/support the same overflow-scaling machinery, so only
         # the autocast context (self.use_amp) extends to MPS, not the scaler.
-        cuda_amp = use_amp and device.type == "cuda"
-        self.use_amp = amp_enabled(use_amp, device)
-        self.amp_dtype = amp_dtype_for(device)
-        self.scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+        self.use_amp, self.amp_dtype, self.scaler = make_amp_context(use_amp, device)
 
         # Backward-compatible shorthand: mixup_alpha > 0 with the default
         # mix_method="none" still enables MixUp, so existing call sites that
@@ -109,6 +105,8 @@ class Trainer:
         }
         self._best_val_loss = float("inf")
         self._patience_counter = 0
+        self.scheduler: LRScheduler | None = None
+        self._epoch = 0
 
     #  Single epoch
 
@@ -207,6 +205,7 @@ class Trainer:
         class_names: list[str] | None = None,
         tail_classes: set[int] | None = None,
         results_dir: str | Path | None = None,
+        resume_from: str | Path | None = None,
     ) -> dict[str, list[float]]:
         """
         Train with linear LR warmup → cosine annealing and early stopping.
@@ -227,6 +226,14 @@ class Trainer:
         This is the only way to see whether the ~34-image tail classes are
         actually improving, since the aggregate val_acc/val_loss above average
         over all 251 classes. 0 disables it (aggregate metrics only).
+
+        ``resume_from`` restores model/optimizer/scheduler/scaler/history from a
+        checkpoint written by ``save_checkpoint`` (a per-epoch ``last_checkpoint.pth``
+        is written automatically at the end of every epoch below) and continues the
+        loop right after the saved epoch — e.g. if training died mid-epoch-10, the
+        checkpoint holds epoch=9 and this resumes at epoch 10, with ``num_epochs``
+        and ``warmup_epochs`` kept the same as the original call so the cosine
+        schedule matches.
         """
         save_dir = Path(model_save_dir) / run_name
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -240,13 +247,26 @@ class Trainer:
         scheduler = SequentialLR(self.optimizer,
                                  schedulers=[warmup_sched, cosine_sched],
                                  milestones=[warmup_epochs])
+        self.scheduler = scheduler
 
         # Optional frozen warm-up (e.g. linear-probe phase on SSL weights).
         if warmup_frozen_epochs > 0 and hasattr(self.model, "freeze_backbone"):
             self.model.freeze_backbone()
 
+        start_epoch = 1
+        if resume_from is not None:
+            self.load_checkpoint(resume_from)
+            start_epoch = self._epoch + 1
+            print(f"Resuming training at epoch {start_epoch}/{num_epochs}")
+            # Match the backbone-freeze state an uninterrupted run would have
+            # reached by this point.
+            if warmup_frozen_epochs > 0 and start_epoch > warmup_frozen_epochs \
+               and hasattr(self.model, "unfreeze_backbone"):
+                self.model.unfreeze_backbone()
+
         t0 = time.time()
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
+            self._epoch = epoch
             if warmup_frozen_epochs > 0 and epoch == warmup_frozen_epochs + 1 \
                and hasattr(self.model, "unfreeze_backbone"):
                 self.model.unfreeze_backbone()
@@ -262,6 +282,7 @@ class Trainer:
             for k, v in zip(
                 ("train_loss", "val_loss", "train_acc", "val_acc", "lr"),
                 (train_loss, val_loss, train_acc, val_acc, lr),
+                strict=True,
             ):
                 self.history[k].append(v)
 
@@ -298,9 +319,16 @@ class Trainer:
                 print(f"  ✓ Best model saved → {ckpt}")
             else:
                 self._patience_counter += 1
-                if self._patience_counter >= patience:
-                    print(f"\nEarly stopping at epoch {epoch}.")
-                    break
+
+            # Full resumable snapshot, overwritten every epoch — if training
+            # dies mid-run (crash, power loss, thermal shutdown), rerun with
+            # train(..., resume_from=save_dir / "last_checkpoint.pth") to
+            # continue right after the last epoch that finished.
+            self.save_checkpoint(save_dir / "last_checkpoint.pth")
+
+            if self._patience_counter >= patience:
+                print(f"\nEarly stopping at epoch {epoch}.")
+                break
 
         print(f"\nTraining finished in {(time.time() - t0) / 60:.1f} min.")
         return self.history
@@ -342,42 +370,49 @@ class Trainer:
 
     def save_checkpoint(self, path: str | Path) -> None:
         """
-        Save a FULL checkpoint (model + optimizer + scaler + history + counters),
-        so training can be resumed exactly. ``train`` saves only model weights for
-        the best epoch; use this when you want to pause and continue later.
+        Save a FULL checkpoint (model + optimizer + scaler + scheduler + epoch +
+        history + counters), so training can be resumed exactly at the next
+        epoch. ``train`` saves only model weights for the best epoch in
+        best_model.pth; this is what ``resume_from=`` reads back in.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
+            "epoch": self._epoch,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "history": self.history,
             "best_val_loss": self._best_val_loss,
             "patience_counter": self._patience_counter,
         }, path)
-        print(f"Checkpoint saved → {path}")
+        print(f"Checkpoint saved → {path} (epoch {self._epoch})")
 
     def load_checkpoint(self, path: str | Path, weights_only: bool = False) -> None:
         """
         Load a checkpoint. With ``weights_only=True`` only the model weights are
         restored (e.g. to load a best_model.pth for evaluation). Otherwise the
-        optimizer, scaler, history and early-stopping state are restored too, so
-        ``train`` can be called again to resume.
+        optimizer, scaler, scheduler, epoch, history and early-stopping state are
+        restored too, so ``train(..., resume_from=path)`` continues right after
+        the saved epoch.
         """
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if weights_only or "model" not in ckpt:
-            state = ckpt["model"] if "model" in ckpt else ckpt
+            state = ckpt.get("model", ckpt)
             self.model.load_state_dict(state)
             print(f"Model weights loaded ← {path}")
             return
         self.model.load_state_dict(ckpt["model"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scaler.load_state_dict(ckpt["scaler"])
+        if ckpt.get("scheduler") is not None and self.scheduler is not None:
+            self.scheduler.load_state_dict(ckpt["scheduler"])
         self.history = ckpt.get("history", self.history)
         self._best_val_loss = ckpt.get("best_val_loss", float("inf"))
         self._patience_counter = ckpt.get("patience_counter", 0)
-        print(f"Full state restored ← {path} (resume-ready)")
+        self._epoch = ckpt.get("epoch", 0)
+        print(f"Full state restored ← {path} (epoch {self._epoch}, resume-ready)")
 
 
 
@@ -393,7 +428,7 @@ def lr_finder(
     model: nn.Module,
     train_loader,
     device: torch.device,
-    criterion: Optional[nn.Module] = None,
+    criterion: nn.Module | None = None,
     start_lr: float = 1e-6,
     end_lr: float = 1.0,
     num_iters: int = 100,
@@ -429,10 +464,7 @@ def lr_finder(
     best = float("inf")
     it = 0
 
-    cuda_amp = device.type == "cuda"
-    use_amp = amp_enabled(True, device)
-    amp_dtype = amp_dtype_for(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+    use_amp, amp_dtype, scaler = make_amp_context(True, device)
 
     done = False
     while not done:
