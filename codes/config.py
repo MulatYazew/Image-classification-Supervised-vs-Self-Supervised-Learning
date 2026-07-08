@@ -20,7 +20,7 @@ The defaults below are tuned for Apple Silicon (MPS) but fall back to CUDA/CPU.
 
 from pathlib import Path
 
-from . import utils as _utils
+import utils as _utils
 
 #  Reproducibility 
 SEED = 42
@@ -37,7 +37,6 @@ IMAGE_DIR    = DATA_DIR / "train_set"            # raw training images
 TEST_IMAGE_DIR = DATA_DIR / "test_set"
 TRAIN_CSV    = DATA_DIR / "train_labels.csv"     # manifest: image_id,label of training data
 TEST_CSV     = DATA_DIR / "test_labels.csv"      # manifest: image_id, label of the test data
-CLASS_LIST_PATH = DATA_DIR / "class_list.txt"    # "<id> <name>" per line -- real food names
 CLEAN_CSV    = PROJECT_ROOT / "results" / "train_labels_clean.csv"  # post-outlier manifest
 MODELS_DIR   = PROJECT_ROOT / "models"
 RESULTS_DIR  = PROJECT_ROOT / "results"
@@ -125,8 +124,8 @@ CLASS_WEIGHT_SCHEME = "sqrt_inv"
 # plateaued candidate stop before burning its full probe budget. This is a
 # separate, local-to-the-search-loop mechanism from Trainer's own early
 # stopping (PATIENCE below), which only applies to the Phase C full retrain.
-TUNE_EARLY_STOP_PATIENCE     = 10
-SSL_TUNE_EARLY_STOP_PATIENCE = 10
+TUNE_EARLY_STOP_PATIENCE     = 5
+SSL_TUNE_EARLY_STOP_PATIENCE = 5
 # probe_supervised's per-epoch early-stop CHECK (only engages when
 # TUNE_EARLY_STOP_PATIENCE > 0) samples only this many batches of the
 # Phase A/B tuning validation loader (tune_val_loader -- already a separate,
@@ -160,7 +159,7 @@ if TUNE_MODE == "full":
 elif TUNE_MODE == "fast_dev":
     TUNE_STRATEGY         = "random"
     TUNE_N_RANDOM_CONFIGS = 10
-    TUNE_PROBE_EPOCHS     = 4
+    TUNE_PROBE_EPOCHS     = 5
     SSL_TUNE_PROBE_EPOCHS = 3
 else:
     raise ValueError(f"Unknown TUNE_MODE '{TUNE_MODE}'. Choose: fast_dev, full.")
@@ -200,7 +199,7 @@ if _DEVICE_RESOLVED.type == "cuda":
 # Choices: "simclr" (contrastive) | "rotation" (4-way rotation prediction)
 SSL_METHOD          = "simclr"
 SSL_EPOCHS          = 100
-SSL_BATCH_SIZE      = 128
+SSL_BATCH_SIZE      = 64
 SSL_LEARNING_RATE   = 1e-3
 SSL_WEIGHT_DECAY    = 1e-4
 SSL_TEMPERATURE     = 0.5       # SimCLR NT-Xent temperature

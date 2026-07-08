@@ -36,10 +36,11 @@ and a couple of tiny callbacks, so it works for both the SL and SSL tasks.
 
 from __future__ import annotations
 
+import gc
 import itertools
 import time
 from dataclasses import dataclass, field
-from collections.abc import Callable, Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -49,11 +50,11 @@ from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score
 
-from .model import build_model, BaseModel
-from .loss_function import build_criterion
-from .data_handler import compute_class_weights, check_single_imbalance_correction
+from model import build_model, BaseModel
+from loss_function import build_criterion
+from data_handler import compute_class_weights, check_single_imbalance_correction
 
-from .utils import get_device, LocalEarlyStopper, make_amp_context
+from utils import get_device, LocalEarlyStopper, amp_enabled, amp_dtype_for
 
 # Progress bars for the probe loops. Falls back to a no-op shim if tqdm isn't
 # installed, so the module never hard-depends on it.
@@ -132,6 +133,20 @@ def default_sl_grid() -> dict[str, list]:
     }
 
 
+def _load_best_sl_hparams(model_name: str = "foodnet46") -> dict:
+    """
+    Read the tuned SL winner's config for ``model_name`` from
+    ``results/<model_name>_best_hparams.json`` (written by the SL tuning
+    phase / ``write_tuning_summary``-adjacent export). Used to seed lr/
+    weight_decay for the SSL grid instead of re-searching them from scratch.
+    """
+    import json
+    from . import config as _cfg
+    path = _cfg.RESULTS_DIR / f"{model_name}_best_hparams.json"
+    with open(path) as f:
+        return json.load(f)["config"]
+
+
 def default_ssl_grid() -> dict[str, list]:
     """
     Self-supervised grid (applies to whichever pretext method you tune).
@@ -142,17 +157,22 @@ def default_ssl_grid() -> dict[str, list]:
     Instead you run tune_ssl once per method and compare the winners — exactly
     the SL-vs-SSL-vs-method workflow the report asks for.
 
-    temperature only affects SimCLR; it is ignored for rotation. classifier
-    selects the downstream traditional read-out and is tuned too.
+    lr and weight_decay are NOT tuned here — they're fixed to the values
+    already found by the SL search for this backbone (results/
+    foodnet46_best_hparams.json), so this grid only searches the two axes
+    that are SSL-specific: temperature (NT-Xent sharpness, SimCLR only —
+    ignored for rotation) and classifier (the downstream traditional
+    read-out). projection_dim and width_mult stay at their config defaults.
     """
+    best_sl = _load_best_sl_hparams("foodnet46")
     return {
         "model_name":     ["foodnet46"],
-        "lr":             [5e-4, 1e-3],
+        "lr":             [best_sl["lr"]],
         "temperature":    [0.1, 0.5],            # NT-Xent sharpness (SimCLR only)
-        "weight_decay":   [1e-4],
+        "weight_decay":   [best_sl["weight_decay"]],
         "projection_dim": [128],
         "classifier":     ["logreg", "linear_svm", "knn"],
-        "width_mult":     [1.0, 0.75],
+        "width_mult":     [1.0],
     }
 
 
@@ -201,7 +221,7 @@ def iter_grid(grid: dict[str, list]) -> Iterable[dict]:
     """Yield every combination of the grid as a config dict (Cartesian product)."""
     keys = list(grid.keys())
     for values in itertools.product(*(grid[k] for k in keys)):
-        yield dict(zip(keys, values, strict=True))
+        yield dict(zip(keys, values))
 
 
 def sample_random_configs(grid: dict[str, list], n: int, seed: int = 42) -> list[dict]:
@@ -351,7 +371,10 @@ def probe_supervised(
     # Autocast now also engages on MPS (measured speedup on this M4 Mac -- see
     # config.AMP_MPS_DTYPE); GradScaler stays CUDA-only since MPS doesn't
     # need/support the same overflow-scaling machinery.
-    amp_on, amp_dtype, scaler = make_amp_context(use_amp, device)
+    cuda_amp = use_amp and device.type == "cuda"
+    amp_on = amp_enabled(use_amp, device)
+    amp_dtype = amp_dtype_for(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
     def _validate(max_batches: int | None = None) -> tuple[float, float]:
         # Validation accuracy AND macro-F1 (the selection metric — see
@@ -532,10 +555,23 @@ def grid_search_over_configs(
 
         reset_peak_mem(device)
         t0 = time.time()
-        val_acc, _, val_f1_macro, epochs_run = probe_fn(
+        val_acc, trial_model, val_f1_macro, epochs_run = probe_fn(
             cfg, device=device, selection_metric=selection_metric, **probe_kwargs)
         elapsed = time.time() - t0
         peak = peak_mem_mb(device)
+
+        # Each trial builds its own model (+ optimizer/projection-head state)
+        # on the accelerator. Without an explicit free here, the reference
+        # lives until the *next* loop iteration reassigns it, and CUDA's
+        # caching allocator never gets a chance to release/reuse it in
+        # between — across a long grid this fragments and eventually OOMs
+        # even though each individual trial fits in memory on its own.
+        del trial_model
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
 
         res = TrialResult(
             config=cfg, val_accuracy=val_acc, val_f1_macro=val_f1_macro,

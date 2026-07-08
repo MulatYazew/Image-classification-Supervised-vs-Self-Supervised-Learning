@@ -122,38 +122,9 @@ def build_dataframe(
     return df.reset_index(drop=True)
 
 
-def load_class_names(
-    df: pd.DataFrame | None = None,
-    num_classes: int = 251,
-    class_list_path: str | Path | None = None,
-) -> dict[int, str]:
-    """Return {label_id: name}. Falls back to 'class_<i>' for any missing id.
-
-    ``df.attrs["label_names"]`` (set by ``build_dataframe``) only holds real
-    names when the CSV's label column was originally strings that got
-    factorised — for this dataset the label column is already numeric IDs, so
-    those attrs are just stringified ints ("0", "1", ...), not food names.
-    Pass ``class_list_path`` (config.CLASS_LIST_PATH, "<id> <name>" per line)
-    to fill in the real names; where both sources cover the same id, this one
-    wins.
-    """
-    names: dict[int, str] = {}
-    if df is not None:
-        names.update(df.attrs.get("label_names", {}))
-    if class_list_path is not None:
-        path = Path(class_list_path)
-        if path.exists():
-            for line in path.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                idx_str, _, name = line.partition(" ")
-                try:
-                    idx = int(idx_str)
-                except ValueError:
-                    continue
-                if 0 <= idx < num_classes:
-                    names[idx] = name
+def load_class_names(df: pd.DataFrame, num_classes: int = 251) -> dict[int, str]:
+    """Return {label_id: name}. Falls back to 'class_<i>' for any missing id."""
+    names = dict(df.attrs.get("label_names", {}))
     return {i: names.get(i, f"class_{i}") for i in range(num_classes)}
 
 
@@ -193,7 +164,7 @@ def stratified_split(
     for _, group in df.groupby("label"):
         idx = group.index.to_numpy().copy()
         rng.shuffle(idx)
-        n_val = max(1, round(len(idx) * val_split)) if len(idx) > 1 else 0
+        n_val = max(1, int(round(len(idx) * val_split))) if len(idx) > 1 else 0
         val_idx.extend(idx[:n_val].tolist())
         train_idx.extend(idx[n_val:].tolist())
     train_df = df.loc[train_idx].reset_index(drop=True)
@@ -240,16 +211,14 @@ def get_transforms(image_size: int = 224, augment: bool = True, intensity: float
         ])
 
     scale = float(np.clip(intensity, 0.0, 1.0)) / 0.5   # 1.0 at the default intensity=0.5
-
-    def p(base: float) -> float:
-        return float(np.clip(base * scale, 0.0, 1.0))
+    p = lambda base: float(np.clip(base * scale, 0.0, 1.0))          # noqa: E731
     crop_lo = float(np.clip(1.0 - 0.3 * scale, 0.3, 1.0))
-    rotate_limit = max(1, round(15 * scale))
+    rotate_limit = max(1, int(round(15 * scale)))
     affine_rotate = 10 * scale
     affine_translate = float(np.clip(0.05 * scale, 0.0, 0.3))
     affine_scale = float(np.clip(0.1 * scale, 0.0, 0.4))
     hue_jitter = min(0.06, 0.03 * scale)                             # tightly capped regardless of scale
-    n_holes = max(1, round(2 * scale))
+    n_holes = max(1, int(round(2 * scale)))
     hole_frac = float(np.clip(0.10 * scale, 0.03, 0.25))
 
     return A.Compose([
@@ -416,7 +385,7 @@ def compute_tail_classes(dataframe: pd.DataFrame, num_classes: int = 251,
         ``config.TAIL_CLASS_FRACTION``.
     """
     counts = dataframe["label"].value_counts().reindex(range(num_classes), fill_value=0)
-    n_tail = max(1, round(num_classes * tail_frac))
+    n_tail = max(1, int(round(num_classes * tail_frac)))
     return set(counts.sort_values(kind="mergesort").index[:n_tail].tolist())
 
 

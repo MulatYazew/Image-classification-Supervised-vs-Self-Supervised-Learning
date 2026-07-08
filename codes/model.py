@@ -392,7 +392,7 @@ class FoodNet30(BaseModel):
         w = self.width_mult
 
         def c(ch: int) -> int:                 # width-scaled channel count
-            return max(8, round(ch * w))
+            return max(8, int(round(ch * w)))
 
         stem_out = c(64)
         feat = c(1024)
@@ -476,7 +476,7 @@ class FoodNet46(BaseModel):
     NAME = "foodnet46"
 
     # (expand_ratio, out_channels, num_blocks, stride)
-    STAGES = (
+    STAGES = [
         (1,  24, 1, 1),
         (4,  40, 2, 2),
         (4,  80, 2, 2),   # 2 blocks at 28×28  (was 3)
@@ -484,7 +484,7 @@ class FoodNet46(BaseModel):
         (6, 112, 2, 1),   # 2 blocks at 14×14  (was 4)
         (6, 192, 3, 2),   # 3 blocks at  7×7   (was 6)
         (6, 192, 2, 1),   # 2 blocks at  7×7   (was 4)
-    )
+    ]
     NECK_CH       = 768   # reduced from 960; still sufficient for 251 classes
     MAX_DROP_PATH = 0.2
 
@@ -492,7 +492,7 @@ class FoodNet46(BaseModel):
         w = self.width_mult
 
         def c(ch: int) -> int:
-            return max(8, round(ch * w))
+            return max(8, int(round(ch * w)))
 
         # Pre-compute linearly-spaced DropPath rates: 0.0 → _MAX_DROP_PATH.
         total_blocks = sum(n for _, _, n, _ in self.STAGES)
@@ -589,4 +589,4 @@ if __name__ == "__main__":
         feats = m.forward_features(x)
         assert logits.shape == (2, 251), logits.shape
         assert feats.shape[1] == info["feature_dim"], feats.shape
-        print(f"{info['name']:<18}{info['total_params_M']:>10}{info['feature_dim']:>10}{info['under_10M']!s:>8}")
+        print(f"{info['name']:<18}{info['total_params_M']:>10}{info['feature_dim']:>10}{str(info['under_10M']):>8}")
