@@ -125,6 +125,23 @@ def amp_dtype_for(device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def make_amp_context(use_amp: bool, device: torch.device) -> tuple[bool, torch.dtype, torch.amp.GradScaler]:
+    """
+    One-call AMP setup, returning ``(autocast_enabled, autocast_dtype, scaler)``.
+
+    ``autocast_enabled``/``autocast_dtype`` are exactly ``amp_enabled(use_amp,
+    device)``/``amp_dtype_for(device)``. The ``GradScaler`` stays CUDA-only
+    regardless of the MPS autocast decision: MPS doesn't need/support the same
+    overflow-scaling machinery, only CUDA's fp16 autocast does. Consolidates
+    the 4-line block that was previously repeated identically in
+    ``Trainer.__init__``/``lr_finder`` (train.py), ``probe_supervised``
+    (hyperparameter_tuning.py), and ``pretrain_simclr``/``pretrain_rotation``
+    (self_supervised.py).
+    """
+    cuda_amp = use_amp and device.type == "cuda"
+    return amp_enabled(use_amp, device), amp_dtype_for(device), torch.amp.GradScaler("cuda", enabled=cuda_amp)
+
+
 #  Device-aware NUM_WORKERS
 
 NUM_WORKERS_CANDIDATES = (4, 6, 8, 12)   # CUDA benchmark sweep (see select_num_workers)
