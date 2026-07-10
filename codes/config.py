@@ -200,7 +200,7 @@ if _DEVICE_RESOLVED.type == "cuda":
 # Choices: "simclr" (contrastive) | "rotation" (4-way rotation prediction)
 SSL_METHOD          = "simclr"
 SSL_EPOCHS          = 100
-SSL_BATCH_SIZE      = 128
+SSL_BATCH_SIZE      = 64
 SSL_LEARNING_RATE   = 1e-3
 SSL_WEIGHT_DECAY    = 1e-4
 SSL_TEMPERATURE     = 0.5       # SimCLR NT-Xent temperature

@@ -187,7 +187,9 @@ class Evaluator:
 
 #  SL vs SSL comparison 
 
-def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> pd.DataFrame:
+def compare_paradigms(sl_metrics: dict, ssl_metrics: dict,
+                      sl_label: str = "Supervised (SL)",
+                      ssl_label: str = "Self-Supervised (SSL)") -> pd.DataFrame:
     """
     Build the headline SL-vs-SSL comparison table for the report.
 
@@ -195,6 +197,14 @@ def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> pd.DataFrame:
         sl_metrics  : Evaluator metrics dict from the supervised model.
         ssl_metrics : Evaluator metrics dict from the SSL + traditional-classifier
                       pipeline (via metrics_from_predictions on val_predictions).
+        sl_label    : column header for the supervised row values. Pass something
+                      unambiguous (e.g. "Supervised (best CNN: foodnet46)").
+        ssl_label   : column header for the SSL row values. Pass something that
+                      names it as the FROZEN-FEATURE + TRADITIONAL-CLASSIFIER
+                      result (e.g. "Self-Supervised downstream classifier (SimCLR
+                      features + logreg)"), never just "SimCLR" -- that would read
+                      as the pretext task's own accuracy, which doesn't exist
+                      (NT-Xent has no classification accuracy).
     """
 
     keys = ["accuracy", "f1_macro", "f1_weighted",
@@ -205,8 +215,8 @@ def compare_paradigms(sl_metrics: dict, ssl_metrics: dict) -> pd.DataFrame:
         ssl = ssl_metrics.get(k, float("nan"))
         rows.append({
             "metric": k,
-            "Supervised (SL)": round(sl, 4),
-            "Self-Supervised (SSL)": round(ssl, 4),
+            sl_label: round(sl, 4),
+            ssl_label: round(ssl, 4),
             "Δ (SL − SSL)": round(sl - ssl, 4),
         })
     return pd.DataFrame(rows)
@@ -255,3 +265,55 @@ def plot_ssl_curves(history: dict, method: str = "", save_path: str | None = Non
     if save_path:
         plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.show()
+
+
+def plot_ssl_downstream_performance(train_metrics: dict, val_metrics: dict, method: str = "",
+                                    classifier: str = "", save_path: str | None = None) -> pd.DataFrame:
+    """
+    Bar chart + summary table for the SSL DOWNSTREAM (read-out) classifier's
+    own train-vs-val accuracy and macro-F1.
+
+    This is deliberately separate from ``plot_ssl_curves`` (the pretext-task
+    NT-Xent/rotation loss, which has no train/val split of its own): the
+    traditional classifier (logreg/linear_svm/knn) is a single fit on frozen
+    features, not an iterative training run, so there is no per-epoch curve --
+    just one train score and one val score per metric. The gap between them is
+    what shows whether the read-out classifier over/underfits the frozen
+    features, independent of how well the pretext task converged.
+
+    Args:
+        train_metrics : ``Evaluator.metrics_from_predictions`` output scored on
+                        the classifier's OWN training features/labels.
+        val_metrics   : same, scored on the val (= test) features/labels.
+        method        : pretext method name, e.g. "simclr" (plot title only).
+        classifier    : classifier name, e.g. "logreg" (plot title only).
+
+    Returns:
+        The summary DataFrame (accuracy/f1_macro train vs val vs gap) -- also
+        useful to ``display()`` or save as CSV alongside the plot.
+    """
+    keys = ["accuracy", "f1_macro"]
+    df = pd.DataFrame([
+        {
+            "metric": k,
+            "train": train_metrics.get(k, float("nan")),
+            "val": val_metrics.get(k, float("nan")),
+            "gap (train − val)": train_metrics.get(k, float("nan")) - val_metrics.get(k, float("nan")),
+        }
+        for k in keys
+    ])
+
+    x = np.arange(len(df)); width = 0.35
+    _fig, ax = plt.subplots(figsize=(6, 5))
+    ax.bar(x - width / 2, df["train"], width, label="train")
+    ax.bar(x + width / 2, df["val"], width, label="val")
+    ax.set_xticks(x); ax.set_xticklabels(df["metric"])
+    ax.set_ylabel("score")
+    title = " ".join(p for p in (method, classifier) if p) or "SSL downstream classifier"
+    ax.set_title(f"{title}: downstream classifier train vs val")
+    ax.legend()
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.show()
+    return df

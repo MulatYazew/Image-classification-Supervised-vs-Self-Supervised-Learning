@@ -382,6 +382,12 @@ def run_ssl_pipeline(
     extracted feature arrays, and validation predictions/labels (hand these to
     codes.evaluate.Evaluator for the SAME metrics used in the SL task, so the
     SL-vs-SSL comparison is apples-to-apples).
+
+    The classifier's TRAIN predictions are also returned (``train_predictions``)
+    alongside its VAL predictions, so the downstream (read-out) classifier's own
+    train-vs-val accuracy/macro-F1 can be measured -- i.e. whether the
+    logreg/linear_svm/knn head over- or under-fits the frozen SimCLR features,
+    a question the pretext loss curve (NT-Xent) says nothing about.
     """
     device = device or get_device()
     if method == "simclr":
@@ -403,6 +409,7 @@ def run_ssl_pipeline(
 
     print(f"[SSL] Fitting traditional classifier: {classifier}")
     clf = fit_traditional_classifier(Xtr, ytr, classifier=classifier, seed=seed)
+    train_pred = clf.predict(Xtr)
     val_pred = clf.predict(Xva)
 
     return {
@@ -412,5 +419,6 @@ def run_ssl_pipeline(
         "train_labels": ytr,
         "val_features": Xva,
         "val_labels": yva,
+        "train_predictions": train_pred,
         "val_predictions": val_pred,
     }
