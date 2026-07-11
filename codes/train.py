@@ -1,16 +1,13 @@
 """
 FoodNet Supervised Trainer
 ===========================
-Training loop for the SUPERVISED (SL) task:
-  - configurable loss (CE / weighted-CE / focal, via codes.loss_function.build_criterion)
-  - AdamW + CosineAnnealingLR
-  - gradient clipping (stabilises from-scratch training)
-  - early stopping on validation loss
-  - best-model checkpointing
-  - MPS / CUDA / CPU compatible
+Training loop for the supervised (SL) task: configurable loss (CE/weighted-CE
+/focal via loss_function.build_criterion), AdamW + CosineAnnealingLR,
+gradient clipping, early stopping on validation loss, best-model
+checkpointing, MPS/CUDA/CPU compatible.
 
-It also exposes a ``grid_search`` helper so the report's hyper-parameter tuning
-section can sweep a small grid and keep the best configuration.
+Also exposes lr_finder and log_run helpers for the report's tuning and
+ablation sections.
 """
 
 from __future__ import annotations
@@ -26,8 +23,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, S
 
 from .utils import make_amp_context
 
-# Progress bars. Falls back to a no-op shim if tqdm isn't installed, so the
-# trainer never hard-depends on it.
 try:
     from tqdm.auto import tqdm
     HAS_TQDM = True
@@ -39,24 +34,13 @@ except ImportError:  # pragma: no cover
 
 
 class Trainer:
-    """
-    Manages the supervised training loop for a custom Food-251 model.
+    """Supervised training loop for a custom Food-251 model.
 
-    Args:
-        model         : a codes.model BaseModel instance.
-        device        : torch.device.
-        criterion     : loss module (from codes.loss_function.build_criterion). If None,
-                        falls back to plain CrossEntropyLoss with class_weights.
-        learning_rate : initial LR.
-        weight_decay  : AdamW weight decay.
-        class_weights : optional 1-D tensor used only for the fallback criterion.
-        mix_method    : "none" | "mixup" | "cutmix" — sample-mixing regulariser
-                        (config.MIX_METHOD). CutMix tends to help more than
-                        MixUp on fine-grained, texture-heavy classes because it
-                        preserves local texture patches instead of globally
-                        blending pixel values.
-        mixup_alpha   : Beta(alpha, alpha) shape for MixUp (ignored otherwise).
-        cutmix_alpha  : Beta(alpha, alpha) shape for CutMix's box size (ignored otherwise).
+    mix_method ("none"|"mixup"|"cutmix", config.MIX_METHOD) is CutMix or
+    MixUp sample-mixing regularisation — CutMix tends to help more on
+    fine-grained, texture-heavy classes since it preserves local texture
+    patches instead of globally blending pixels. class_weights is only used
+    when criterion is None (fallback plain CrossEntropyLoss).
     """
 
     def __init__(
@@ -82,16 +66,12 @@ class Trainer:
 
         self.optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-        # Mixed precision: ~2x faster and ~half the memory on CUDA; autocast
-        # also engages on MPS (measured speedup on this M4 Mac -- see
-        # config.AMP_MPS_DTYPE). GradScaler stays CUDA-only regardless: MPS
-        # doesn't need/support the same overflow-scaling machinery, so only
-        # the autocast context (self.use_amp) extends to MPS, not the scaler.
+        # Autocast also engages on MPS (measured speedup on this M4); GradScaler
+        # stays CUDA-only since MPS doesn't need the same overflow-scaling machinery
         self.use_amp, self.amp_dtype, self.scaler = make_amp_context(use_amp, device)
 
-        # Backward-compatible shorthand: mixup_alpha > 0 with the default
-        # mix_method="none" still enables MixUp, so existing call sites that
-        # only pass mixup_alpha keep working unchanged.
+        # mixup_alpha > 0 with default mix_method="none" still enables MixUp,
+        # so existing call sites that only pass mixup_alpha keep working
         if mix_method == "none" and mixup_alpha > 0.0:
             mix_method = "mixup"
         if mix_method not in ("none", "mixup", "cutmix"):
@@ -108,23 +88,19 @@ class Trainer:
         self.scheduler: LRScheduler | None = None
         self._epoch = 0
 
-    #  Single epoch
+    # Single epoch
 
     def mixup_batch(self, images: torch.Tensor, labels: torch.Tensor):
-        """Apply MixUp to a batch.  Returns (mixed_images, y_a, y_b, lam)."""
+        """Apply MixUp to a batch. Returns (mixed_images, y_a, y_b, lam)."""
         lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
         idx = torch.randperm(images.size(0), device=images.device)
         mixed = lam * images + (1.0 - lam) * images[idx]
         return mixed, labels, labels[idx], lam
 
     def cutmix_batch(self, images: torch.Tensor, labels: torch.Tensor):
-        """
-        Apply CutMix to a batch: paste a random box from a shuffled copy of
-        the batch into each image, and mix the labels by the actual (not
-        sampled) box area — the standard CutMix recipe. Returns
-        ``(mixed_images, y_a, y_b, lam)`` with the same contract as
-        ``mixup_batch`` so ``run_epoch`` can treat both uniformly.
-        """
+        """Apply CutMix: paste a random box from a shuffled copy of the batch
+        into each image, mixing labels by the actual (not sampled) box area.
+        Same (mixed_images, y_a, y_b, lam) contract as mixup_batch."""
         lam_sampled = float(np.random.beta(self.cutmix_alpha, self.cutmix_alpha))
         idx = torch.randperm(images.size(0), device=images.device)
         h, w = images.shape[2], images.shape[3]
@@ -136,9 +112,7 @@ class Trainer:
 
         mixed = images.clone()
         mixed[:, :, y1:y2, x1:x2] = images[idx][:, :, y1:y2, x1:x2]
-        # Recompute lam from the ACTUAL pasted area (may differ slightly from
-        # lam_sampled due to integer rounding / border clipping).
-        lam = 1.0 - ((y2 - y1) * (x2 - x1) / (h * w))
+        lam = 1.0 - ((y2 - y1) * (x2 - x1) / (h * w))   # actual pasted area, may differ from lam_sampled
         return mixed, labels, labels[idx], lam
 
     def run_epoch(self, loader, training: bool, desc: str | None = None) -> tuple[float, float]:
@@ -161,10 +135,9 @@ class Trainer:
                     images, y_a, y_b, lam = mix_fn(images, labels)
                     with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                         outputs = self.model(images)
-                        # Mix loss = weighted sum of the two constituent losses.
                         loss = lam * self.criterion(outputs, y_a) + \
                                (1.0 - lam) * self.criterion(outputs, y_b)
-                    # Accuracy: credit the dominant label when lam >= 0.5.
+                    # accuracy: credit the dominant label when lam >= 0.5
                     pred = outputs.argmax(1)
                     hits = (lam * (pred == y_a).float() +
                             (1.0 - lam) * (pred == y_b).float()).sum().item()
@@ -189,7 +162,7 @@ class Trainer:
                                     acc=f"{correct / max(n, 1):.3f}")
         return total_loss / max(n, 1), correct / max(n, 1)
 
-    #  Full loop 
+    # Full loop
 
     def train(
         self,
@@ -207,38 +180,32 @@ class Trainer:
         results_dir: str | Path | None = None,
         resume_from: str | Path | None = None,
     ) -> dict[str, list[float]]:
-        """
-        Train with linear LR warmup → cosine annealing and early stopping.
+        """Train with linear LR warmup -> cosine annealing and early stopping.
 
-        ``warmup_epochs`` linearly ramps the LR from start_factor × base_lr up
-        to base_lr over the first N epochs, then cosine-anneals to eta_min.
-        This prevents the large initial LR from destabilising BN statistics on
-        the first batch, which is especially harmful for deep from-scratch nets.
+        warmup_epochs ramps LR from 0.1x base_lr to base_lr over the first N
+        epochs before cosine-annealing to eta_min, preventing a large initial
+        LR from destabilising BN statistics — especially harmful for deep
+        from-scratch nets.
 
-        ``warmup_frozen_epochs`` > 0 trains only the head for that many epochs
+        warmup_frozen_epochs > 0 trains only the head for that many epochs
         (backbone frozen) before unfreezing — useful when starting from
         SSL-pretrained backbone weights.
 
-        ``log_per_class_every`` > 0 runs a full per-class val precision/
-        recall/F1 report (codes.evaluate.Evaluator) every N epochs (and on
-        the final epoch), printing a one-line tail-vs-head F1 summary and, if
-        ``results_dir`` is given, writing the full per-class table to CSV.
-        This is the only way to see whether the ~34-image tail classes are
-        actually improving, since the aggregate val_acc/val_loss above average
-        over all 251 classes. 0 disables it (aggregate metrics only).
+        log_per_class_every > 0 runs a full per-class val F1 report
+        (evaluate.Evaluator) every N epochs and at the end, printing a
+        tail-vs-head F1 summary (and writing the per-class table to
+        results_dir if given) — the only way to see whether the ~34-image
+        tail classes are actually improving, since aggregate val_acc/loss
+        average over all 251 classes. 0 disables it.
 
-        ``resume_from`` restores model/optimizer/scheduler/scaler/history from a
-        checkpoint written by ``save_checkpoint`` (a per-epoch ``last_checkpoint.pth``
-        is written automatically at the end of every epoch below) and continues the
-        loop right after the saved epoch — e.g. if training died mid-epoch-10, the
-        checkpoint holds epoch=9 and this resumes at epoch 10, with ``num_epochs``
-        and ``warmup_epochs`` kept the same as the original call so the cosine
-        schedule matches.
+        resume_from restores model/optimizer/scheduler/scaler/history from a
+        checkpoint (last_checkpoint.pth is written every epoch) and continues
+        right after the saved epoch, with num_epochs/warmup_epochs unchanged
+        so the cosine schedule still matches.
         """
         save_dir = Path(model_save_dir) / run_name
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # LR schedule: linear warmup then cosine annealing.
         warmup_epochs = max(1, warmup_epochs)
         cosine_epochs = max(1, num_epochs - warmup_epochs)
         warmup_sched = LinearLR(self.optimizer, start_factor=0.1, end_factor=1.0,
@@ -249,7 +216,6 @@ class Trainer:
                                  milestones=[warmup_epochs])
         self.scheduler = scheduler
 
-        # Optional frozen warm-up (e.g. linear-probe phase on SSL weights).
         if warmup_frozen_epochs > 0 and hasattr(self.model, "freeze_backbone"):
             self.model.freeze_backbone()
 
@@ -258,8 +224,7 @@ class Trainer:
             self.load_checkpoint(resume_from)
             start_epoch = self._epoch + 1
             print(f"Resuming training at epoch {start_epoch}/{num_epochs}")
-            # Match the backbone-freeze state an uninterrupted run would have
-            # reached by this point.
+            # match the backbone-freeze state an uninterrupted run would have reached
             if warmup_frozen_epochs > 0 and start_epoch > warmup_frozen_epochs \
                and hasattr(self.model, "unfreeze_backbone"):
                 self.model.unfreeze_backbone()
@@ -293,8 +258,7 @@ class Trainer:
             )
 
             if log_per_class_every > 0 and (epoch % log_per_class_every == 0 or epoch == num_epochs):
-                from .evaluate import Evaluator   # local import: avoids a hard sklearn/seaborn
-                                                   # dependency for callers that never log per-class
+                from .evaluate import Evaluator   # local import: avoids a hard sklearn/seaborn dep for other callers
                 num_classes = getattr(self.model, "num_classes", None)
                 preds, labels_arr = self.predict(val_loader)
                 evaluator = Evaluator(num_classes=num_classes or int(labels_arr.max()) + 1,
@@ -320,10 +284,8 @@ class Trainer:
             else:
                 self._patience_counter += 1
 
-            # Full resumable snapshot, overwritten every epoch — if training
-            # dies mid-run (crash, power loss, thermal shutdown), rerun with
-            # train(..., resume_from=save_dir / "last_checkpoint.pth") to
-            # continue right after the last epoch that finished.
+            # resumable snapshot overwritten every epoch: rerun with
+            # train(..., resume_from=save_dir/"last_checkpoint.pth") after a crash
             self.save_checkpoint(save_dir / "last_checkpoint.pth")
 
             if self._patience_counter >= patience:
@@ -333,25 +295,19 @@ class Trainer:
         print(f"\nTraining finished in {(time.time() - t0) / 60:.1f} min.")
         return self.history
 
-    #  Evaluation / inference 
+    # Evaluation / inference
 
     @torch.no_grad()
     def evaluate(self, loader) -> dict[str, float]:
-        """
-        Run one no-grad pass over ``loader`` and return average loss and accuracy.
-        Convenience wrapper around ``run_epoch`` for a quick val/test score
-        without going through the full training loop.
-        """
+        """One no-grad pass over loader; returns {"loss", "accuracy"} —
+        a quick val/test score without the full training loop."""
         loss, acc = self.run_epoch(loader, training=False)
         return {"loss": loss, "accuracy": acc}
 
     @torch.no_grad()
     def predict(self, loader, return_probs: bool = False) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Predict over ``loader``. Returns ``(predictions, labels)`` as numpy arrays,
-        or ``(probabilities, labels)`` when ``return_probs=True`` (softmax over the
-        251 classes). Labels are returned too so the output lines up for metrics.
-        """
+        """Predict over loader. Returns (predictions, labels), or
+        (probabilities, labels) when return_probs=True (softmax over 251 classes)."""
         self.model.eval()
         preds_or_probs, labels_all = [], []
         for images, labels in loader:
@@ -366,15 +322,13 @@ class Trainer:
             labels_all.append(labels.numpy())
         return np.concatenate(preds_or_probs), np.concatenate(labels_all)
 
-    #  Checkpoint save / resume 
+    # Checkpoint save / resume
 
     def save_checkpoint(self, path: str | Path) -> None:
-        """
-        Save a FULL checkpoint (model + optimizer + scaler + scheduler + epoch +
-        history + counters), so training can be resumed exactly at the next
-        epoch. ``train`` saves only model weights for the best epoch in
-        best_model.pth; this is what ``resume_from=`` reads back in.
-        """
+        """Save a full checkpoint (model/optimizer/scaler/scheduler/epoch/
+        history/counters) for exact resume. train() saves best_model.pth
+        (weights only for the best epoch) separately; this is what
+        resume_from= reads back in."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
@@ -390,13 +344,10 @@ class Trainer:
         print(f"Checkpoint saved → {path} (epoch {self._epoch})")
 
     def load_checkpoint(self, path: str | Path, weights_only: bool = False) -> None:
-        """
-        Load a checkpoint. With ``weights_only=True`` only the model weights are
-        restored (e.g. to load a best_model.pth for evaluation). Otherwise the
-        optimizer, scaler, scheduler, epoch, history and early-stopping state are
-        restored too, so ``train(..., resume_from=path)`` continues right after
-        the saved epoch.
-        """
+        """Load a checkpoint. weights_only=True restores only model weights
+        (e.g. loading best_model.pth for evaluation); otherwise optimizer,
+        scaler, scheduler, epoch, history and early-stopping state are also
+        restored, so train(..., resume_from=path) continues after the saved epoch."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if weights_only or "model" not in ckpt:
             state = ckpt.get("model", ckpt)
@@ -415,8 +366,7 @@ class Trainer:
         print(f"Full state restored ← {path} (epoch {self._epoch}, resume-ready)")
 
 
-
-#  Learning-rate finder 
+# Learning-rate finder
 
 @torch.no_grad()
 def _set_lr(optimizer, lr: float) -> None:
@@ -434,22 +384,16 @@ def lr_finder(
     num_iters: int = 100,
     weight_decay: float = 1e-4,
 ) -> tuple[list[float], list[float]]:
-    """
-    Leslie Smith style LR range test. Trains for ``num_iters`` mini-batches while
-    exponentially increasing the learning rate from ``start_lr`` to ``end_lr``,
-    recording the loss at each step. Plot loss vs lr (log scale) and pick a
-    learning rate roughly one order of magnitude below where the loss is steepest
-    / just before it explodes — a fast, principled alternative to grid-searching
-    the LR when you are not running a full hyperparameter sweep.
-
-    Returns ``(lrs, losses)``. Does NOT mutate the passed model's final weights in
-    a meaningful way for training (it runs a short transient), but for safety run
-    it on a fresh model or rebuild afterwards.
+    """Leslie Smith style LR range test: trains num_iters mini-batches while
+    exponentially raising the LR from start_lr to end_lr, recording loss at
+    each step. Plot loss vs. lr (log scale) and pick a value about one order
+    of magnitude below where loss is steepest / about to explode — a fast
+    alternative to a full LR sweep. Returns (lrs, losses); runs a short
+    transient so use a fresh model or rebuild afterwards.
 
     Example:
-        lrs, losses = lr_finder(M.build_model("foodnet"), train_loader, device)
-        import matplotlib.pyplot as plt
-        plt.plot(lrs, losses); plt.xscale("log"); plt.xlabel("lr"); plt.ylabel("loss")
+        lrs, losses = lr_finder(build_model("foodnet46"), train_loader, device)
+        plt.plot(lrs, losses); plt.xscale("log")
     """
     model = model.to(device).train()
     if criterion is None:
@@ -457,8 +401,7 @@ def lr_finder(
     criterion = criterion.to(device)
     optimizer = AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
 
-    # Geometric LR schedule across iterations.
-    mult = (end_lr / start_lr) ** (1.0 / max(num_iters - 1, 1))
+    mult = (end_lr / start_lr) ** (1.0 / max(num_iters - 1, 1))   # geometric LR step
     lr = start_lr
     lrs, losses = [], []
     best = float("inf")
@@ -487,8 +430,7 @@ def lr_finder(
             lrs.append(lr)
             losses.append(loss_val)
             best = min(best, loss_val)
-            # Stop early if the loss diverges badly (4x the best seen).
-            if loss_val > 4 * best:
+            if loss_val > 4 * best:   # stop early once loss diverges badly
                 done = True
                 break
             lr *= mult
@@ -498,16 +440,13 @@ def lr_finder(
     return lrs, losses
 
 
-#  Experiment logging (augmentation ablation / final-run tracking)
+# Experiment logging (augmentation ablation / final-run tracking)
 
 def log_run(run_name: str, config: dict, metrics: dict, csv_path: str | Path) -> None:
-    """
-    Append one full (non-probe) training run's config + final metrics as a
-    row to a CSV log — e.g. augmentation policy vs. final val accuracy/macro-F1,
-    for the report's augmentation-ablation table. Distinct from
-    hyperparameter_tuning.results_to_csv, which logs cheap HPO *probes*; this
-    logs full/confirmation runs (config.LOG_PER_CLASS_EVERY-style callers).
-    """
+    """Append one full training run's config + final metrics as a CSV row —
+    e.g. augmentation policy vs. final val accuracy/macro-F1 for the report's
+    ablation table. Distinct from hyperparameter_tuning.results_to_csv, which
+    logs cheap HPO probes; this logs full/confirmation runs."""
     import csv as _csv
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)

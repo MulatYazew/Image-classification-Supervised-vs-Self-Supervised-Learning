@@ -29,11 +29,8 @@ from codes import model as M
 
 
 class ArtifactError(RuntimeError):
-    """A required checkpoint/results file is missing or unreadable.
-
-    Caught at the call site so the app can show a clean st.error() instead
-    of crashing with a raw traceback.
-    """
+    """A required checkpoint/results file is missing or unreadable — caught
+    at the call site so the app shows a clean st.error() instead of a raw traceback."""
 
 
 def _require(path: Path, what: str) -> Path:
@@ -48,20 +45,15 @@ def _require(path: Path, what: str) -> Path:
 
 def load_class_names(num_classes: int = 251) -> dict[int, str]:
     """id -> human-readable food name from dataset/class_list.txt, via the
-    same codes.data_handler.load_class_names the training notebook uses (so
-    the app can never drift from the training-time name mapping). Falls back
-    to 'class_<id>' for any id missing from the file (including when the file
-    itself is absent), so the app never crashes over a display label.
-    """
+    same data_handler.load_class_names the training notebook uses. Falls
+    back to 'class_<id>' for any missing id (including a missing file)."""
     return dh.load_class_names(num_classes=num_classes, class_list_path=C.CLASS_LIST_PATH)
 
 
 def load_supervised_model(device: torch.device):
     """Load the overall-best supervised architecture (from
-    results/sl_model_comparison.csv) + its checkpoint.
-
-    Returns (model, info_dict). Raises ArtifactError if anything is missing.
-    """
+    results/sl_model_comparison.csv) + its checkpoint. Returns
+    (model, info_dict); raises ArtifactError if anything is missing."""
     comparison_path = _require(
         C.RESULTS_DIR / "sl_model_comparison.csv", "supervised model comparison table")
     comparison = pd.read_csv(comparison_path)
@@ -92,12 +84,9 @@ def load_supervised_model(device: torch.device):
 
 
 def load_ssl_model(device: torch.device):
-    """Load the winning SSL method's backbone + downstream classifier
-    (from results/ssl_best_hparams.json + models/ssl_best/*).
-
-    Returns (backbone, classifier, info_dict). Raises ArtifactError if
-    anything is missing.
-    """
+    """Load the winning SSL method's backbone + downstream classifier (from
+    results/ssl_best_hparams.json + models/ssl_best/*). Returns (backbone,
+    classifier, info_dict); raises ArtifactError if anything is missing."""
     hparams_path = _require(C.RESULTS_DIR / "ssl_best_hparams.json", "SSL hyperparameters")
     hparams = json.loads(hparams_path.read_text())
     cfg = hparams["config"]
@@ -131,10 +120,9 @@ def load_sl_vs_ssl_comparison() -> pd.DataFrame | None:
 
 
 def preprocess_image(image: Image.Image) -> torch.Tensor:
-    """EXACT training-time preprocessing (data_handler.get_transforms,
+    """Exact training-time preprocessing (data_handler.get_transforms,
     augment=False): resize to config.INPUT_SIZE + ImageNet normalisation.
-    Returns a (1, 3, H, W) tensor ready for model input.
-    """
+    Returns a (1, 3, H, W) tensor ready for model input."""
     rgb = np.array(image.convert("RGB"))
     tf = dh.get_transforms(image_size=C.INPUT_SIZE, augment=False)
     tensor = tf(image=rgb)["image"]
@@ -154,13 +142,11 @@ def predict_supervised(model, tensor: torch.Tensor, device: torch.device,
 @torch.no_grad()
 def predict_self_supervised(backbone, classifier, tensor: torch.Tensor, device: torch.device,
                             class_names: dict[int, str], k: int = 5) -> list[tuple[str, float]]:
-    """
-    Top-k (class_name, confidence) from the frozen SSL backbone's features +
-    traditional classifier. L2-normalises features exactly like
-    self_supervised.extract_features (the classifier was fit on normalised
-    features).  Falls back to a single top-1 prediction with confidence 1.0
-    when the fitted classifier has no predict_proba (e.g. classifier="linear_svm").
-    """
+    """Top-k (class_name, confidence) from the frozen SSL backbone's features
+    + traditional classifier. L2-normalises features exactly like
+    extract_features (the classifier was fit on normalised features). Falls
+    back to a single top-1 prediction with confidence 1.0 when the fitted
+    classifier has no predict_proba (e.g. classifier="linear_svm")."""
     feats = backbone.forward_features(tensor.to(device))
     feats = F.normalize(feats, dim=1).cpu().numpy()
 

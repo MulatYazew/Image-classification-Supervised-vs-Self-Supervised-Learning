@@ -18,14 +18,8 @@ import torch.nn.functional as F
 
 
 class GradCAM:
-    """
-    Grad-CAM for a Food-251 ``BaseModel``.
-
-    Args:
-        model        : a trained codes.model BaseModel.
-        target_layer : conv module to hook. Defaults to the last Conv2d found in
-                       ``model.backbone``.
-    """
+    """Grad-CAM for a Food-251 BaseModel. target_layer defaults to the last
+    Conv2d found in model.backbone."""
 
     def __init__(self, model: nn.Module, target_layer: nn.Module | None = None) -> None:
         self.model = model.eval()
@@ -37,13 +31,10 @@ class GradCAM:
 
     @staticmethod
     def _last_conv(model: nn.Module) -> nn.Module:
-        """
-        Pick the last *spatial* (kernel > 1) conv as the CAM target. The very
-        last Conv2d in this backbone is a 1x1 pointwise mixer, which carries no
-        spatial structure and yields a flat, uninformative heatmap. The last
-        3x3 depthwise conv is the right place to read 'where the model looked'.
-        Falls back to the last conv of any kind if no k>1 conv exists.
-        """
+        """Pick the last spatial (kernel > 1) conv as the CAM target — the
+        backbone's final Conv2d is a 1x1 pointwise mixer with no spatial
+        structure, which would yield a flat heatmap. Falls back to the last
+        conv of any kind if no k>1 conv exists."""
         last_spatial = None
         last_any = None
         for m in model.modules():
@@ -63,10 +54,8 @@ class GradCAM:
         self._gradients = grad_out[0].detach()
 
     def generate(self, input_tensor: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
-        """
-        Produce a [0,1] heatmap (H×W) for ``input_tensor`` (shape (1,3,H,W)).
-        If ``class_idx`` is None, uses the model's top prediction.
-        """
+        """Produce a [0,1] heatmap (HxW) for input_tensor (shape (1,3,H,W)).
+        Uses the model's top prediction when class_idx is None."""
         logits = self.model(input_tensor)
         if class_idx is None:
             class_idx = int(logits.argmax(1).item())

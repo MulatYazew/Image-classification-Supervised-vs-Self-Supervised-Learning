@@ -2,21 +2,15 @@
 FoodNet Data Handler
 =====================
 Dataset, DataLoaders, augmentation pipelines, class-weight helpers, and the
-stratified train/validation split — all *food-dataset aware*.
+stratified train/validation split — all food-dataset aware.
 
-Key spec-driven decisions
--------------------------
-  * 251 classes, always.** ``build_dataframe`` never drops a class. Optional
-    sub-sampling caps images-PER-CLASS only (documented, computational reason).
-  * Validation = our test set, carved from train  ``stratified_split`` holds
-    out a per-class fraction so all 251 classes appear in validation.
-  * Uncontrolled input size → resize to a common square.
-  * RGB kept (food colour is highly discriminative — no greyscale).
-  * Moderate imbalance (100–600 / class) handled by weighted CE / focal loss
-    (see loss_function.py). A single uniform augmentation pipeline is applied
-    across all classes.
-  * SSL views SSLPairDataset returns two augmented views per image with
-    NO label — exactly what SimCLR-style contrastive pretraining needs.
+Key spec-driven decisions: 251 classes always (build_dataframe never drops a
+class; optional sub-sampling only caps images per class). Validation is our
+test set, carved from train via stratified_split so all 251 classes appear
+in both. Inputs are resized to a common square and kept RGB (food colour is
+discriminative). Moderate imbalance (100-600/class) is handled via weighted
+CE/focal loss (loss_function.py). SSLPairDataset returns two augmented views
+per image with no label, for SimCLR-style contrastive pretraining.
 """
 
 from __future__ import annotations
@@ -31,48 +25,30 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset, WeightedRandomSampler
 
-# cv2 spawns its own internal thread pool (TBB/pthreads) per process. When a
-# DataLoader also spawns worker PROCESSES, each worker inherits/re-triggers
-# cv2's own threading on top of the DataLoader's parallelism, and the two
-# thread pools contend for the same physical cores -- this is what actually
-# caused the "num_workers>0 hangs/slows down on Apple Silicon" symptom,
-# not a lack of CPU throughput. Disabling cv2's internal threads (each worker
-# process does its own decode/resize single-threaded) fixed it in benchmarking
-# (see codes/config.py NUM_WORKERS comment for the measured numbers). Must be
-# set here (module import time, main process) AND re-applied per worker via
-# worker_init_fn below, since macOS spawns (not forks) worker processes, which
-# re-run this module top-to-bottom but as a fresh interpreter/cv2 state.
+# cv2's internal thread pool contends with DataLoader worker processes for
+# cores (measured cause of num_workers>0 hangs/slowdowns on Apple Silicon).
+# Must be set here (main process, import time) AND in worker_init_fn below,
+# since macOS spawns (not forks) workers, re-running this module fresh.
 cv2.setNumThreads(0)
 
-# ImageNet statistics are a reasonable normalisation even when training from
-# scratch; they centre RGB inputs sensibly and match the demo / outlier code.
+# ImageNet stats are a reasonable normalisation even when training from scratch
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
 def worker_init_fn(_worker_id: int) -> None:
-    """
-    Pass to every DataLoader's ``worker_init_fn`` when ``num_workers > 0``.
-    REQUIRED, not just belt-and-suspenders: measured directly (spawn 2 workers,
-    have each report ``cv2.getNumThreads()``) that the module-level
-    ``cv2.setNumThreads(0)`` above does NOT persist into spawned worker
-    processes on macOS -- workers came back reporting 10 threads each without
-    this function wired in, and 1 with it. So every DataLoader with
-    ``num_workers > 0`` must pass this, or cv2's own thread pool fights the
-    DataLoader's process-level parallelism inside each worker again.
-    """
+    """Pass to every DataLoader with num_workers > 0 — required: measured
+    that the module-level cv2.setNumThreads(0) does not persist into spawned
+    worker processes on macOS without this (workers came back at 10 threads
+    each without it, 1 with it)."""
     cv2.setNumThreads(0)
 
 
 def loader_kwargs(num_workers: int, prefetch_factor: int = 2) -> dict:
-    """
-    Extra ``DataLoader`` kwargs for ``num_workers`` -- ``persistent_workers``/
-    ``prefetch_factor``/``worker_init_fn`` only when ``num_workers > 0``
-    (PyTorch raises a ``ValueError`` if ``persistent_workers``/
-    ``prefetch_factor`` are passed alongside ``num_workers=0``). Spread into
-    every ``DataLoader(...)`` call: ``DataLoader(ds, num_workers=n,
-    **dh.loader_kwargs(n))``.
-    """
+    """Extra DataLoader kwargs for num_workers — persistent_workers/
+    prefetch_factor/worker_init_fn only when num_workers > 0 (PyTorch errors
+    if they're passed alongside num_workers=0). Spread into every
+    DataLoader(ds, num_workers=n, **loader_kwargs(n))."""
     if num_workers <= 0:
         return {}
     return {
@@ -82,20 +58,16 @@ def loader_kwargs(num_workers: int, prefetch_factor: int = 2) -> dict:
     }
 
 
-#  Manifest construction & label maps
+# Manifest construction & label maps
 
 def build_dataframe(
     csv_path: str | Path,
     image_col_candidates: tuple[str, ...] = ("image_id", "img_id", "image", "filename", "id", "img_name", "image_name"),
     label_col_candidates: tuple[str, ...] = ("label", "class", "class_id", "category", "target"),
 ) -> pd.DataFrame:
-    """
-    Load a labels CSV and normalise it to columns ``image_id`` (str) and
-    ``label`` (int). Raises if either column cannot be found.
-
-    String labels (e.g. food-name folders) are factorised to contiguous integer
-    ids 0..K-1; the mapping is stored on the returned frame as ``df.attrs``.
-    """
+    """Load a labels CSV, normalise to columns image_id (str) and label (int);
+    raises if either can't be found. String labels are factorised to
+    contiguous ints 0..K-1, with the mapping stored on df.attrs."""
     df = pd.read_csv(csv_path)
     rename: dict[str, str] = {}
     for col in df.columns:
@@ -110,7 +82,6 @@ def build_dataframe(
 
     df["image_id"] = df["image_id"].astype(str)
 
-    # Map string labels → contiguous ints if needed.
     if not np.issubdtype(df["label"].dtype, np.integer):
         codes, uniques = pd.factorize(df["label"], sort=True)
         df["label"] = codes.astype(int)
@@ -127,15 +98,11 @@ def load_class_names(
     num_classes: int = 251,
     class_list_path: str | Path | None = None,
 ) -> dict[int, str]:
-    """Return {label_id: name}. Falls back to 'class_<i>' for any missing id.
-
-    ``df.attrs["label_names"]`` (set by ``build_dataframe``) only holds real
-    names when the CSV's label column was originally strings that got
-    factorised — for this dataset the label column is already numeric IDs, so
-    those attrs are just stringified ints ("0", "1", ...), not food names.
-    Pass ``class_list_path`` (config.CLASS_LIST_PATH, "<id> <name>" per line)
-    to fill in the real names; where both sources cover the same id, this one
-    wins.
+    """Return {label_id: name}, falling back to 'class_<i>' for missing ids.
+    df.attrs["label_names"] only holds real names when the CSV's label column
+    was originally strings — this dataset's labels are already numeric IDs,
+    so pass class_list_path (config.CLASS_LIST_PATH, "<id> <name>" per line)
+    to fill in real food names; where both sources cover an id, this wins.
     """
     names: dict[int, str] = {}
     if df is not None:
@@ -158,13 +125,9 @@ def load_class_names(
 
 
 def cap_images_per_class(df: pd.DataFrame, max_per_class: int | None, seed: int = 42) -> pd.DataFrame:
-    """
-    Optionally cap images PER CLASS (documented computational-cost reduction).
-
-    The number of classes is preserved — every class that exists keeps at least
-    its available images up to ``max_per_class``. Returns ``df`` unchanged when
-    ``max_per_class`` is None.
-    """
+    """Optionally cap images per class (documented compute-cost reduction);
+    the set of classes itself is unchanged. Returns df unchanged if
+    max_per_class is None."""
     if max_per_class is None:
         return df.reset_index(drop=True)
     capped = pd.concat([
@@ -179,14 +142,10 @@ def stratified_split(
     val_split: float = 0.15,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Stratified train/validation split — the validation set is our test set and
-    is carved out of the training data (the official test split has no GT).
-
-    Stratifying by ``label`` guarantees every one of the 251 classes is present
-    in BOTH partitions. Classes with very few samples still contribute at least
-    one validation image.
-    """
+    """Stratified train/validation split — validation is our test set (the
+    official test split has no ground truth). Stratifying by label guarantees
+    every one of the 251 classes appears in both partitions, with at least
+    one validation image even for the smallest classes."""
     rng = np.random.default_rng(seed)
     train_idx: list[int] = []
     val_idx: list[int] = []
@@ -201,36 +160,23 @@ def stratified_split(
     return train_df, val_df
 
 
-#  Augmentation pipelines 
+# Augmentation pipelines
 
 def get_transforms(image_size: int = 224, augment: bool = True, intensity: float = 0.5) -> A.Compose:
-    """
-    Standard pipeline for majority classes (training) and val/inference.
+    """Standard pipeline for majority classes (training) and val/inference.
 
-    ``intensity`` in [0, 1] scales every magnitude/probability below via
-    ``scale = intensity / 0.5``, so ``intensity=0.5`` reproduces the original
-    hand-tuned pipeline exactly, ``intensity=0`` degrades towards a near
-    identity transform, and ``intensity=1`` is a visibly more aggressive
-    policy. This lets a single config value (``config.AUGMENTATION_INTENSITY``)
-    drive the report's augmentation-ablation runs.
+    intensity in [0, 1] scales every magnitude/probability via
+    scale = intensity / 0.5, so intensity=0.5 reproduces the original
+    hand-tuned pipeline, 0 degrades towards near-identity, 1 is visibly more
+    aggressive — lets config.AUGMENTATION_INTENSITY drive ablation runs.
 
-    Food-specific choices:
-      - RandomResizedCrop  : plates are shot at varying distances / framings.
-      - HorizontalFlip     : food has no preferred left/right orientation.
-      - Rotate (±20°)      : casual phone photos are rarely perfectly level.
-      - BrightnessContrast : restaurant vs daylight vs flash lighting varies.
-      - ColorJitter (mild) : white-balance differs across cameras — but hue is
-                             capped tight (even at intensity=1) because colour
-                             is a strong food cue (e.g. garlic bread vs.
-                             focaccia); a wide hue jitter could turn a tomato
-                             blue. Grayscale is deliberately NOT used here for
-                             the same reason (unlike the SSL pipeline below,
-                             which can afford to destroy colour because it
-                             only needs structural invariance).
-      - CoarseDropout      : simulates garnish, utensils, or a hand partially
-                             covering the dish.
-      - RandomShadow       : simulates uneven restaurant/daylight lighting.
-      - Normalize          : ImageNet stats centre the RGB inputs.
+    Food-specific choices: RandomResizedCrop (varying plate framing),
+    HorizontalFlip (no preferred orientation), Rotate ±20° (casual phone
+    photos), BrightnessContrast (lighting varies), ColorJitter with hue
+    capped tight even at intensity=1 (colour is a strong food cue — a wide
+    hue jitter could turn a tomato blue; no grayscale, unlike the SSL
+    pipeline below which can afford to destroy colour), CoarseDropout
+    (garnish/utensils/hand occlusion), RandomShadow (uneven lighting).
     """
     if not augment:
         return A.Compose([
@@ -248,7 +194,7 @@ def get_transforms(image_size: int = 224, augment: bool = True, intensity: float
     affine_rotate = 10 * scale
     affine_translate = float(np.clip(0.05 * scale, 0.0, 0.3))
     affine_scale = float(np.clip(0.1 * scale, 0.0, 0.4))
-    hue_jitter = min(0.06, 0.03 * scale)                             # tightly capped regardless of scale
+    hue_jitter = min(0.06, 0.03 * scale)                             # capped regardless of scale
     n_holes = max(1, round(2 * scale))
     hole_frac = float(np.clip(0.10 * scale, 0.03, 0.25))
 
@@ -273,16 +219,12 @@ def get_transforms(image_size: int = 224, augment: bool = True, intensity: float
     ])
 
 
-
 def get_ssl_transforms(image_size: int = 224) -> A.Compose:
-    """
-    Strong augmentation for SELF-SUPERVISED contrastive pretraining (SimCLR).
-
-    Two independent draws of this pipeline on the same image form a positive
-    pair. The heavy crop + colour distortion + grayscale + blur is the standard
-    SimCLR recipe — it forces the backbone to learn food structure invariant to
-    appearance nuisances, without using any labels.
-    """
+    """Strong augmentation for SimCLR contrastive pretraining — two
+    independent draws of this pipeline on the same image form a positive
+    pair. Standard SimCLR recipe (heavy crop + colour distortion + grayscale
+    + blur) forces the backbone to learn structure invariant to appearance,
+    without labels."""
     return A.Compose([
         A.RandomResizedCrop(size=(image_size, image_size), scale=(0.2, 1.0), p=1.0),
         A.HorizontalFlip(p=0.5),
@@ -294,7 +236,7 @@ def get_ssl_transforms(image_size: int = 224) -> A.Compose:
     ])
 
 
-#  Datasets 
+# Datasets
 
 def read_rgb(path: Path) -> np.ndarray:
     image = cv2.imread(str(path))
@@ -304,28 +246,13 @@ def read_rgb(path: Path) -> np.ndarray:
 
 
 class FoodDataset(Dataset):
-    """
-    Supervised Food-251 dataset.
+    """Supervised Food-251 dataset (columns image_id, label).
 
-    Class imbalance is primarily handled via weighted CE / focal loss (see
-    loss_function.py). Optionally, a SECOND, complementary correction can be
-    enabled here: classes in ``tail_classes`` are augmented at a higher
-    ``intensity`` (``intensity * tail_boost``) so the data-poor classes see
-    more diverse synthetic variation per epoch. This is independent of the
-    loss-weight / sampler correction (which reweights gradients, not pixels),
-    so it is safe to combine with either — unlike sampler-vs-loss-weights,
-    there is no double-correction risk here.
-
-    Args:
-        dataframe    : columns 'image_id' and 'label'.
-        images_dir   : directory of raw images.
-        augment      : apply training augmentations when True.
-        image_size   : common resize target (uncontrolled inputs → square).
-        intensity    : base augmentation intensity (config.AUGMENTATION_INTENSITY).
-        tail_classes : optional set of class ids to augment more aggressively
-                       (see ``compute_tail_classes``); None/empty = uniform
-                       augmentation across all classes (original behaviour).
-        tail_boost   : multiplier applied to ``intensity`` for tail classes.
+    Imbalance is primarily handled via weighted CE/focal loss. Optionally, a
+    second, independent correction can be enabled here: tail_classes get
+    augmented at intensity * tail_boost for more diverse synthetic variation
+    per epoch — this reweights pixels, not gradients, so it's safe to combine
+    with either loss-weight or sampler correction (no double-correction risk).
     """
 
     def __init__(
@@ -342,8 +269,7 @@ class FoodDataset(Dataset):
         self.images_dir = Path(images_dir)
         self.tail_classes = tail_classes or set()
         self.tf = get_transforms(image_size, augment=augment, intensity=intensity)
-        # Only build a second pipeline when tail-aware augmentation is actually
-        # requested; otherwise every sample uses the single uniform pipeline.
+        # only build a second pipeline when tail-aware augmentation is requested
         self.tf_tail = (
             get_transforms(image_size, augment=augment, intensity=min(1.0, intensity * tail_boost))
             if augment and self.tail_classes else self.tf
@@ -361,13 +287,9 @@ class FoodDataset(Dataset):
 
 
 class SSLPairDataset(Dataset):
-    """
-    Self-supervised dataset: returns TWO augmented views of each image and NO
-    label. Feed the pair to a SimCLR NT-Xent loss for contrastive pretraining.
-
-    The labels in the manifest are deliberately ignored here — this is the
-    "ignore the labels" SSL setting required by the exam.
-    """
+    """Self-supervised dataset: returns two augmented views of each image and
+    no label, for a SimCLR NT-Xent loss. Manifest labels are deliberately
+    ignored — the "ignore the labels" SSL setting required by the exam."""
 
     def __init__(self, dataframe: pd.DataFrame, images_dir: str | Path, image_size: int = 224) -> None:
         self.df = dataframe.reset_index(drop=True)
@@ -386,61 +308,40 @@ class SSLPairDataset(Dataset):
 
 
 class FeatureExtractionDataset(FoodDataset):
-    """
-    Deterministic (no-augmentation) dataset used to extract frozen-backbone
-    features for the SSL → traditional-classifier pipeline. Returns
-    ``(image_tensor, label)`` so the traditional classifier can be fit/scored.
-
-    A clearly-named, no-augmentation alias for ``FoodDataset`` — same
-    ``(image, label)`` contract, just named for where it's actually used so
-    call sites read as intent ("extract features") rather than an
-    augmentation flag.
-    """
+    """Deterministic (no-augmentation) FoodDataset alias for extracting
+    frozen-backbone features in the SSL -> traditional-classifier pipeline —
+    named for intent rather than passing an augment flag at call sites."""
 
     def __init__(self, dataframe: pd.DataFrame, images_dir: str | Path, image_size: int = 224) -> None:
         super().__init__(dataframe, images_dir, augment=False, image_size=image_size)
 
 
-#  Class-weight / sampler / minority helpers
+# Class-weight / sampler / minority helpers
 
 def compute_tail_classes(dataframe: pd.DataFrame, num_classes: int = 251,
                          tail_frac: float = 0.2) -> set[int]:
-    """
-    Return the class ids in the smallest ``tail_frac`` fraction of the
-    per-class image-count distribution (e.g. the ~34-image classes).
-
-    Two consumers share this single definition of "tail class" so the report
-    stays internally consistent:
-      * ``FoodDataset`` (tail-aware augmentation boost, see above), and
-      * ``evaluate.py`` (head-vs-tail metric breakdown), via
-        ``config.TAIL_CLASS_FRACTION``.
-    """
+    """Class ids in the smallest tail_frac fraction of the per-class image
+    count (e.g. the ~34-image classes). Shared definition used by both
+    FoodDataset (tail-aware augmentation) and evaluate.py (head-vs-tail
+    metric breakdown, via config.TAIL_CLASS_FRACTION)."""
     counts = dataframe["label"].value_counts().reindex(range(num_classes), fill_value=0)
     n_tail = max(1, round(num_classes * tail_frac))
     return set(counts.sort_values(kind="mergesort").index[:n_tail].tolist())
 
 
 def _label_counts(dataframe: pd.DataFrame, num_classes: int) -> torch.Tensor:
-    """Per-class image counts as a dense ``(num_classes,)`` tensor, vectorised
-    (``value_counts`` + ``reindex``) rather than looping row-by-row in Python
-    — shared by ``compute_class_weights`` and ``build_weighted_sampler``.
-    """
+    """Per-class image counts as a dense (num_classes,) tensor, vectorised
+    rather than looped — shared by compute_class_weights and build_weighted_sampler."""
     counts = dataframe["label"].value_counts().reindex(range(num_classes), fill_value=0)
     return torch.tensor(counts.to_numpy(), dtype=torch.float)
 
 
 def check_single_imbalance_correction(use_weighted_sampler: bool,
                                       class_weights: torch.Tensor | None) -> None:
-    """
-    Raise if BOTH a weighted sampler and non-None loss class-weights are
-    active at once. Stacking the two over-corrects the same imbalance twice
-    (oversampling rare classes AND up-weighting their loss), which can
-    destabilise training on the rarest ~34-image classes. Call this once
-    after building the sampler/criterion for a run — cheap, and turns the
-    "pick exactly one" convention documented on ``compute_class_weights`` /
-    ``build_weighted_sampler`` into an enforced invariant rather than a
-    comment that can silently rot.
-    """
+    """Raise if both a weighted sampler and loss class-weights are active at
+    once — stacking both over-corrects the same imbalance (oversampling rare
+    classes AND up-weighting their loss), destabilising the rarest ~34-image
+    classes. Enforces the "pick exactly one" convention as an invariant."""
     if use_weighted_sampler and class_weights is not None:
         raise ValueError(
             "Both a WeightedRandomSampler and non-None class_weights are active — "
@@ -452,27 +353,15 @@ def check_single_imbalance_correction(use_weighted_sampler: bool,
 def compute_class_weights(dataframe: pd.DataFrame, num_classes: int = 251,
                           scheme: str = "sqrt_inv", beta: float = 0.999,
                           clip: float = 10.0) -> torch.Tensor:
-    """
-    Per-class loss weights for the REAL Food-251 imbalance.
-
-    The actual training distribution is far more skewed than the spec's nominal
-    "100–600": measured counts run from ~34 (class 162) to ~656, i.e. roughly
-    19:1, not 6:1. Raw inverse frequency (``N / (K * count_c)``) then hands
-    the 34-image class a ~20x gradient multiplier, which amplifies label noise on
-    exactly the classes with the least reliable signal and destabilises training.
-
-    Three milder schemes are offered (default ``sqrt_inv``):
-
-      * ``inv``       : classic inverse frequency (kept for reference / ablation).
-      * ``sqrt_inv``  : weights ∝ 1/sqrt(count_c) — tempers the tail (the standard
-                        practical choice for ~10–20:1 imbalance).
-      * ``effective`` : class-balanced weights ∝ (1 - beta) / (1 - beta^count_c)
-                        (Cui et al., 2019), with ``beta`` near 1.
-
-    All schemes are mean-normalised to ≈1 (so the overall loss scale matches an
-    unweighted run) and clipped at ``clip`` to bound the largest multiplier.
-    Pass the result to CrossEntropy / Focal — and use EITHER this OR a weighted
-    sampler, never both (see config.USE_WEIGHTED_SAMPLER / loss.py).
+    """Per-class loss weights for the real Food-251 imbalance (measured
+    ~34-656 images/class, ~19:1, worse than the spec's nominal 100-600).
+    Raw inverse frequency would give the 34-image class a ~20x gradient
+    multiplier, amplifying its label noise — so three milder schemes are
+    offered (default sqrt_inv): "inv" (classic inverse frequency, for
+    reference/ablation), "sqrt_inv" (weights ~ 1/sqrt(count), standard for
+    ~10-20:1 imbalance), "effective" (class-balanced weights, Cui et al. 2019,
+    beta near 1). All schemes are mean-normalised to ~1 and clipped at clip.
+    Use this OR a weighted sampler, never both.
     """
     counts = _label_counts(dataframe, num_classes).clamp(min=1.0)
 
@@ -491,19 +380,14 @@ def compute_class_weights(dataframe: pd.DataFrame, num_classes: int = 251,
     return w
 
 
-
 def build_weighted_sampler(dataframe: pd.DataFrame, num_classes: int = 251) -> WeightedRandomSampler:
-    """
-    WeightedRandomSampler for balanced mini-batches (use INSTEAD of loss weights).
-
-    Unlike the loss weights (which are sqrt-tempered to avoid over-amplifying the
-    34-image class), the sampler uses RAW inverse-frequency per-sample weights:
-    its job is to make every class equally likely to appear in a batch, so the
-    rarest classes are oversampled with replacement. Combining this with weighted
-    loss would double-correct, so pick exactly one (config.USE_WEIGHTED_SAMPLER).
-    """
+    """WeightedRandomSampler for balanced mini-batches (use instead of loss
+    weights). Uses raw inverse-frequency per-sample weights (unlike the
+    sqrt-tempered loss weights) so rare classes are oversampled with
+    replacement until every class is equally likely per batch. Combining with
+    weighted loss double-corrects — pick exactly one (config.USE_WEIGHTED_SAMPLER)."""
     counts = _label_counts(dataframe, num_classes).clamp(min=1.0)
-    inv_freq = 1.0 / counts                       # raw inverse frequency per class
+    inv_freq = 1.0 / counts
     labels = torch.from_numpy(dataframe["label"].to_numpy().astype("int64"))
     sample_weights = inv_freq[labels]
     return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
