@@ -1,11 +1,14 @@
 """
 FoodNet Evaluator
 =================
-Computes accuracy, precision, recall, F1-score, confusion matrices, and a
-per-class report. Works for both paradigms: supervised (pass model + loader
-to evaluate) and self-supervised (pass val_predictions/val_labels straight to
-metrics_from_predictions, no model needed). compare_paradigms builds the
-SL-vs-SSL table for the report.
+Computes the exam-required metrics — accuracy, precision, recall, F1-score —
+plus confusion matrices and a per-class report. Works for BOTH paradigms:
+
+  * Supervised : pass a trained model + DataLoader to "evaluate".
+  * Self-sup.  : pass the SSL pipeline's "val_predictions" / "val_labels"
+                 straight to "metrics_from_predictions" (no model needed).
+
+A "compare_paradigms" helper assembles the SL-vs-SSL table for the report.
 """
 
 from __future__ import annotations
@@ -23,8 +26,14 @@ from sklearn.metrics import (
 
 
 class Evaluator:
-    """Metrics and visualisations for Food-251 models. class_names defaults
-    to "class_i" placeholders when not given."""
+    """
+    Metrics and visualisations for Food-251 models.
+
+    Args:
+        num_classes : 251.
+        class_names : list of names (length num_classes); auto-filled if None.
+        device      : inference device.
+    """
 
     def __init__(self, num_classes: int = 251, class_names: list[str] | None = None,
                  device: torch.device = torch.device("cpu")) -> None:
@@ -32,11 +41,11 @@ class Evaluator:
         self.device = device
         self.class_names = class_names or [f"class_{i}" for i in range(num_classes)]
 
-    # Inference
+    #  Inference 
 
     @torch.no_grad()
     def predict(self, model: nn.Module, loader) -> tuple[np.ndarray, np.ndarray]:
-        """Run model over loader; return (predictions, true_labels)."""
+        """Run ``model`` over ``loader``; return (predictions, true_labels)."""
         model = model.to(self.device).eval()
         preds, labels = [], []
         for images, lbls in loader:
@@ -45,12 +54,16 @@ class Evaluator:
             labels.extend(lbls.numpy())
         return np.array(preds), np.array(labels)
 
-    # Metrics
+    #  Metrics 
 
     @staticmethod
     def metrics_from_predictions(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-        """Accuracy + macro & weighted precision/recall/F1. Macro treats
-        every one of the 251 classes equally; weighted accounts for support."""
+        """
+        Accuracy + macro & weighted precision/recall/F1.
+
+        Macro treats every one of the 251 classes equally (so the small classes
+        count as much as the big ones); weighted accounts for support.
+        """
         return {
             "accuracy": accuracy_score(y_true, y_pred),
             "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
@@ -62,10 +75,14 @@ class Evaluator:
         }
 
     def per_class_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> pd.DataFrame:
-        """Per-class precision/recall/F1/support, not just the macro average
-        — with ~19:1 imbalance, macro-F1 can look fine while the smallest
-        (~34-image) classes sit at zero recall; this table shows whether
-        those tail classes are actually improving."""
+        """
+        Per-class precision/recall/F1/support — NOT just the macro average.
+
+        With ~19:1 class imbalance, macro-F1 can look acceptable while the
+        smallest (~34-image) classes sit at zero recall; this table is what
+        actually shows whether those tail classes are improving across a
+        training run, rather than the head classes inflating the average.
+        """
         labels = np.arange(self.num_classes)
         precision = precision_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
         recall = recall_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
@@ -83,12 +100,19 @@ class Evaluator:
     @staticmethod
     def head_vs_tail_summary(per_class_df: pd.DataFrame, tail_classes: set[int] | None = None,
                              tail_frac: float = 0.2) -> dict:
-        """Split the per-class table into head/tail groups and report mean
-        recall/F1 for each — shows whether an imbalance fix is actually
-        helping data-poor classes, not just moving the macro average via the
-        head classes. tail_classes should match data_handler.compute_tail_classes;
-        if omitted, the smallest tail_frac of classes by support here are used
-        (only valid for a representative validation split)."""
+        """
+        Split the per-class table into head/tail groups and report mean
+        recall/F1 for each — the single number that tells you whether an
+        imbalance fix (re-weighting, tail-aware augmentation, oversampling)
+        is actually helping the data-poor classes rather than just the
+        macro average moving because the head classes got better.
+
+        ``tail_classes`` should be ``data_handler.compute_tail_classes(...)``
+        so the definition of "tail" matches the one used for augmentation;
+        if omitted, the smallest ``tail_frac`` of classes BY SUPPORT in this
+        table are used instead (only valid when the table covers a
+        representative validation split).
+        """
         if tail_classes is None:
             n_tail = max(1, round(len(per_class_df) * tail_frac))
             tail_classes = set(
@@ -123,13 +147,15 @@ class Evaluator:
                 n += len(labels)
         return correct / max(n, 1)
 
-    # Confusion matrix
+    #  Confusion matrix 
 
     def plot_confusion_matrix(self, y_true, y_pred, figsize=(12, 10), normalize=True,
                               annotate=False, save_path: str | None = None) -> None:
-        """Confusion-matrix heatmap. With 251 classes the cells are tiny, so
-        annotations default off and normalisation by true-label count reveals
-        systematic confusions between similar dishes."""
+        """
+        Confusion-matrix heatmap. For 251 classes the cells are tiny, so the
+        default omits annotations and normalises by true-label counts to reveal
+        systematic confusions between similar dishes.
+        """
         cm = confusion_matrix(y_true, y_pred)
         fmt = "d"
         if normalize:
@@ -146,10 +172,10 @@ class Evaluator:
             plt.savefig(save_path, dpi=120, bbox_inches="tight")
         plt.show()
 
-    # Full pipeline
+    #  Full pipeline 
 
     def evaluate(self, model: nn.Module, loader) -> dict:
-        """Predict -> metrics -> confusion matrix (supervised path)."""
+        """Predict → metrics → confusion matrix (supervised path)."""
         y_pred, y_true = self.predict(model, loader)
         return {
             "predictions": y_pred,
@@ -159,16 +185,28 @@ class Evaluator:
         }
 
 
-# SL vs SSL comparison
+#  SL vs SSL comparison 
 
 def compare_paradigms(sl_metrics: dict, ssl_metrics: dict,
                       sl_label: str = "Supervised (SL)",
                       ssl_label: str = "Self-Supervised (SSL)") -> pd.DataFrame:
-    """Build the headline SL-vs-SSL comparison table for the report. Pass
-    unambiguous labels — ssl_label should name it as the frozen-feature +
-    traditional-classifier result (e.g. "SimCLR features + logreg"), never
-    just "SimCLR", since the pretext task itself has no classification
-    accuracy (NT-Xent isn't a classifier)."""
+    """
+    Build the headline SL-vs-SSL comparison table for the report.
+
+    Args:
+        sl_metrics  : Evaluator metrics dict from the supervised model.
+        ssl_metrics : Evaluator metrics dict from the SSL + traditional-classifier
+                      pipeline (via metrics_from_predictions on val_predictions).
+        sl_label    : column header for the supervised row values. Pass something
+                      unambiguous (e.g. "Supervised (best CNN: foodnet46)").
+        ssl_label   : column header for the SSL row values. Pass something that
+                      names it as the FROZEN-FEATURE + TRADITIONAL-CLASSIFIER
+                      result (e.g. "Self-Supervised downstream classifier (SimCLR
+                      features + logreg)"), never just "SimCLR" -- that would read
+                      as the pretext task's own accuracy, which doesn't exist
+                      (NT-Xent has no classification accuracy).
+    """
+
     keys = ["accuracy", "f1_macro", "f1_weighted",
             "precision_macro", "recall_macro"]
     rows = []
@@ -200,11 +238,18 @@ def plot_training_curves(history: dict, save_path: str | None = None) -> None:
 
 
 def plot_ssl_curves(history: dict, method: str = "", save_path: str | None = None) -> None:
-    """Plot an SSL pretraining history (pretrain_simclr/pretrain_rotation):
-    pretext ssl_loss per epoch, plus ssl_acc (rotation's 4-way accuracy) when
-    present. Separate from plot_training_curves because SSL pretraining has
-    no labelled validation split during the pretext task — one loss curve,
-    not a train-vs-val pair."""
+    """
+    Plot an SSL pretraining history dict (``self_supervised.pretrain_simclr`` /
+    ``pretrain_rotation``): the pretext ``ssl_loss`` per epoch, plus
+    ``ssl_acc`` (rotation's 4-way prediction accuracy) when present.
+
+    Unlike ``plot_training_curves`` (which expects a supervised ``Trainer``
+    history's train/val loss+accuracy KEYS), SSL pretraining has no labelled
+    validation split during the pretext task itself — there is one loss curve
+    (SimCLR NT-Xent, or rotation cross-entropy + its own accuracy), not a
+    train-vs-val pair, hence a dedicated plot rather than reusing
+    ``plot_training_curves`` on a differently-shaped dict.
+    """
     has_acc = bool(history.get("ssl_acc"))
     _fig, axes = plt.subplots(1, 2 if has_acc else 1, figsize=(14, 5) if has_acc else (7, 5))
     ax1 = axes[0] if has_acc else axes
@@ -224,18 +269,28 @@ def plot_ssl_curves(history: dict, method: str = "", save_path: str | None = Non
 
 def plot_ssl_downstream_performance(train_metrics: dict, val_metrics: dict, method: str = "",
                                     classifier: str = "", save_path: str | None = None) -> pd.DataFrame:
-    """Bar chart + summary table for the SSL downstream classifier's own
-    train-vs-val accuracy and macro-F1. Separate from plot_ssl_curves (the
-    pretext loss, with no train/val split): the traditional classifier
-    (logreg/linear_svm/knn) is a single fit on frozen features, so there's
-    one train score and one val score per metric, not a per-epoch curve —
-    the train/val gap shows whether the read-out over/underfits the frozen
-    features, independent of pretext convergence.
+    """
+    Bar chart + summary table for the SSL DOWNSTREAM (read-out) classifier's
+    own train-vs-val accuracy and macro-F1.
 
-    train_metrics/val_metrics are Evaluator.metrics_from_predictions output
-    scored on the classifier's own train vs. val(=test) features/labels.
-    method/classifier are used only for the plot title. Returns the summary
-    DataFrame (accuracy/f1_macro train vs val vs gap).
+    This is deliberately separate from ``plot_ssl_curves`` (the pretext-task
+    NT-Xent/rotation loss, which has no train/val split of its own): the
+    traditional classifier (logreg/linear_svm/knn) is a single fit on frozen
+    features, not an iterative training run, so there is no per-epoch curve --
+    just one train score and one val score per metric. The gap between them is
+    what shows whether the read-out classifier over/underfits the frozen
+    features, independent of how well the pretext task converged.
+
+    Args:
+        train_metrics : ``Evaluator.metrics_from_predictions`` output scored on
+                        the classifier's OWN training features/labels.
+        val_metrics   : same, scored on the val (= test) features/labels.
+        method        : pretext method name, e.g. "simclr" (plot title only).
+        classifier    : classifier name, e.g. "logreg" (plot title only).
+
+    Returns:
+        The summary DataFrame (accuracy/f1_macro train vs val vs gap) -- also
+        useful to ``display()`` or save as CSV alongside the plot.
     """
     keys = ["accuracy", "f1_macro"]
     df = pd.DataFrame([

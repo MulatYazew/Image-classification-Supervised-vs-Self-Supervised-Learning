@@ -2,8 +2,9 @@
 FoodNet Demo — Supervised vs Self-Supervised Food-251 classification.
 
 Loads the overall-best supervised model and the winning self-supervised
-model (backbone + traditional classifier) produced by the training notebook,
-and serves single-image or batch predictions with a side-by-side comparison view.
+model (backbone + traditional classifier) produced by the training
+notebook, and serves single-image or batch predictions with a
+side-by-side comparison view.
 """
 
 import base64

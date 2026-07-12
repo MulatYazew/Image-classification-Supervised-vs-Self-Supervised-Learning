@@ -29,10 +29,18 @@ def set_seed(seed: int = 42) -> None:
 
 
 def get_device(prefer: str | None = None) -> torch.device:
-    """Resolve the compute device. prefer (or config.DEVICE when None):
-    "auto" picks CUDA > MPS > CPU; "cuda"/"mps"/"cpu" uses that backend if
-    available, else falls back to auto with a warning (so a config pinned to
-    "cuda" still runs on an M-series Mac instead of crashing)."""
+    """
+    Resolve the compute device.
+
+    ``prefer`` (or config.DEVICE when None) may be:
+      * "auto"  → pick the best available: CUDA → MPS (Apple Silicon) → CPU.
+      * "cuda" / "mps" / "cpu" → use that backend if available, else warn and
+        fall back to auto-detection (so a config pinned to "cuda" still runs on
+        an M-series Mac instead of crashing).
+
+    AMP (GradScaler) is CUDA-only and engages automatically there; on MPS/CPU the
+    trainer runs full precision.
+    """
     if prefer is None:
         try:
             from . import config as _cfg
@@ -56,6 +64,7 @@ def get_device(prefer: str | None = None) -> torch.device:
         return torch.device("mps")
     if prefer == "cpu":
         return torch.device("cpu")
+    # Requested backend not available → fall back gracefully.
     dev = _auto()
     import warnings
     warnings.warn(f"Requested device '{prefer}' unavailable; using '{dev.type}'.", stacklevel=2)
@@ -63,11 +72,24 @@ def get_device(prefer: str | None = None) -> torch.device:
 
 
 def amp_enabled(use_amp: bool, device: torch.device) -> bool:
-    """True if autocast should engage. CUDA always follows use_amp. MPS is
-    gated by config.AMP_MPS_ENABLED (default False): measured ~14% SLOWER
-    than FP32 on this MacBook Air M4 (foodnet46, batch 64) for both float16
-    and bfloat16 autocast, so it stays off unless explicitly opted into.
-    CPU never autocasts."""
+    """
+    True if autocast should engage.
+
+    CUDA: always follows ``use_amp`` (autocast is a clear win there).
+
+    MPS: gated by config.AMP_MPS_ENABLED, default False. MEASURED on a
+    MacBook Air M4 (foodnet46, batch 64, 20-batch/3-repeat harness): FP32
+    ran at 0.658 s/batch vs 0.748-0.749 s/batch for BOTH float16 and
+    bfloat16 autocast -- i.e. autocast was ~14% SLOWER, not faster, on this
+    backend/model, reproduced across two independent FP32 re-checks. The
+    infrastructure (this function + amp_dtype_for) is kept because it's the
+    correct plumbing on CUDA and costs nothing when disabled, but it must
+    NOT be forced on for MPS by default given it measurably regresses this
+    workload -- flip config.AMP_MPS_ENABLED=True to opt in if a future torch
+    version or different model changes this.
+
+    CPU never autocasts.
+    """
     if device.type == "cuda":
         return use_amp
     if device.type == "mps":
@@ -80,12 +102,21 @@ def amp_enabled(use_amp: bool, device: torch.device) -> bool:
 
 
 def amp_dtype_for(device: torch.device) -> torch.dtype:
-    """Autocast dtype per backend: float16 on CUDA (paired with a CUDA-only
-    GradScaler). On MPS, config.AMP_MPS_DTYPE picks float16 (default) or
-    bfloat16. Returns float32 when autocast is disabled/CPU."""
+    """
+    Autocast dtype per backend: float16 on CUDA (paired with a CUDA-only
+    GradScaler for overflow protection). On MPS, config.AMP_MPS_DTYPE picks
+    float16 (default) or bfloat16 -- set from a 1-epoch stability sanity check
+    on this project's from-scratch BatchNorm models (see config.py). Unused
+    (returns float32) when autocast is disabled/CPU.
+    """
     if device.type == "cuda":
         return torch.float16
     if device.type == "mps":
+        # Mirrors get_device()'s defensive fallback above: every caller in
+        # this package imports via proper relative/package imports (codes.*),
+        # so this relative import always resolves in practice -- the
+        # try/except only guards against this module being executed outside
+        # the codes package (e.g. copied elsewhere without its __init__.py).
         try:
             from . import config as _cfg
         except ImportError:
@@ -95,23 +126,30 @@ def amp_dtype_for(device: torch.device) -> torch.dtype:
 
 
 def make_amp_context(use_amp: bool, device: torch.device) -> tuple[bool, torch.dtype, torch.amp.GradScaler]:
-    """One-call AMP setup: (autocast_enabled, autocast_dtype, scaler).
-    GradScaler stays CUDA-only regardless of the MPS autocast decision, since
-    only CUDA's fp16 autocast needs overflow-scaling. Consolidates a block
-    previously duplicated across Trainer/lr_finder, probe_supervised, and
-    pretrain_simclr/pretrain_rotation."""
+    """
+    One-call AMP setup, returning ``(autocast_enabled, autocast_dtype, scaler)``.
+
+    ``autocast_enabled``/``autocast_dtype`` are exactly ``amp_enabled(use_amp,
+    device)``/``amp_dtype_for(device)``. The ``GradScaler`` stays CUDA-only
+    regardless of the MPS autocast decision: MPS doesn't need/support the same
+    overflow-scaling machinery, only CUDA's fp16 autocast does. Consolidates
+    the 4-line block that was previously repeated identically in
+    ``Trainer.__init__``/``lr_finder`` (train.py), ``probe_supervised``
+    (hyperparameter_tuning.py), and ``pretrain_simclr``/``pretrain_rotation``
+    (self_supervised.py).
+    """
     cuda_amp = use_amp and device.type == "cuda"
     return amp_enabled(use_amp, device), amp_dtype_for(device), torch.amp.GradScaler("cuda", enabled=cuda_amp)
 
 
-# Device-aware NUM_WORKERS
+#  Device-aware NUM_WORKERS
 
 NUM_WORKERS_CANDIDATES = (4, 6, 8, 12)   # CUDA benchmark sweep (see select_num_workers)
 
 
 def _num_workers_cache_path(results_dir: str | Path | None) -> Path:
-    """Resolve the cache file path, falling back to config.RESULTS_DIR (or a
-    bare "results" dir) when the caller doesn't pass one explicitly."""
+    """Resolve the cache file path, falling back to config.RESULTS_DIR (or
+    a bare "results" dir) when the caller doesn't pass one explicitly."""
     if results_dir is None:
         try:
             from . import config as _cfg
@@ -122,11 +160,15 @@ def _num_workers_cache_path(results_dir: str | Path | None) -> Path:
 
 
 def load_num_workers_benchmark(device: torch.device, results_dir: str | Path | None = None) -> dict | None:
-    """This machine's cached CUDA select_num_workers benchmark entry
-    ({"num_workers", "sec_per_batch", "candidates"}), or None for non-CUDA
-    devices or before the first benchmark has run. Shared by
-    select_num_workers (cache-hit check) and config.py (to override
-    BENCHMARKED_SEC_PER_BATCH with this machine's own measurement on CUDA)."""
+    """
+    This machine's cached CUDA ``select_num_workers`` benchmark entry --
+    ``{"num_workers": int, "sec_per_batch": {"4": ..., ...}, "candidates": [...]}``
+    -- or ``None`` for non-CUDA devices, or before the first benchmark has run.
+
+    Shared by ``select_num_workers`` (cache-hit check) and ``config.py``
+    (to override ``BENCHMARKED_SEC_PER_BATCH`` with THIS machine's own
+    measurement instead of the Mac-only default when running on CUDA).
+    """
     if device.type != "cuda":
         return None
     cache_path = _num_workers_cache_path(results_dir)
@@ -147,10 +189,15 @@ def _benchmark_num_workers_cuda(
     batch_size: int = 64,
     model_name: str = "foodnet46",
 ) -> dict[int, float]:
-    """Median sec/batch per candidate num_workers on the real training
-    pipeline (same 20-batch/3-repeat harness used to hand-pick
-    NUM_WORKERS=4 on the MacBook, automated here for CUDA). A fresh
-    DataLoader is built per candidate so persistent_workers restarts cleanly."""
+    """
+    Median sec/batch per candidate ``num_workers``, measured on the REAL
+    training pipeline -- the same harness (20-batch/3-repeat, foodnet46,
+    batch 64, worker_init_fn + persistent_workers via
+    ``data_handler.loader_kwargs``) used to hand-pick NUM_WORKERS=4 on the
+    MacBook (see config.py's MPS comment), just automated here for CUDA.
+    A fresh DataLoader is built per candidate so persistent_workers actually
+    restarts a clean worker pool each time.
+    """
     from torch.optim import AdamW
     from torch.utils.data import DataLoader
 
@@ -203,9 +250,12 @@ def _benchmark_num_workers_cuda(
 def _pick_preferred_num_workers(sec_per_batch: dict[int, float],
                                 preferred: tuple[int, ...] = (6, 8),
                                 tolerance: float = 0.15) -> int:
-    """Prefer the faster of the preferred candidates (6 or 8) unless another
-    candidate beats it by more than tolerance — mirrors the ">15%" rule used
-    to hand-pick NUM_WORKERS on the Mac."""
+    """
+    Prefer the faster of the ``preferred`` candidates (6 or 8) unless some
+    OTHER candidate beats it by more than ``tolerance`` (fractional sec/batch
+    improvement) -- mirrors the ">15%" rule used to hand-pick NUM_WORKERS on
+    the Mac (see config.py).
+    """
     fastest_n = min(sec_per_batch, key=lambda n: sec_per_batch[n])
     preferred_present = {n: t for n, t in sec_per_batch.items() if n in preferred}
     if not preferred_present or fastest_n in preferred:
@@ -223,18 +273,31 @@ def select_num_workers(
     results_dir: str | Path | None = None,
     cpu_fallback: int = 4,
 ) -> int:
-    """Device-aware DataLoader num_workers, resolved automatically right
-    after get_device() — no manual benchmarking on either machine.
+    """
+    Device-aware DataLoader ``num_workers``, resolved automatically right
+    after ``get_device()`` -- no manual benchmarking step on either machine.
 
-    MPS -> 0 immediately: cv2's thread pool fights DataLoader worker
-    processes on Apple Silicon, and data loading measured at only ~13% of
-    batch time there anyway. CUDA -> benchmarks NUM_WORKERS_CANDIDATES on
-    this machine's real pipeline the first time (see
-    _benchmark_num_workers_cuda), preferring 6/8 unless another candidate
-    wins by >15%; cached to <results_dir>/num_workers_benchmark.json keyed
-    by GPU name, so later runs just load the cached value
-    (force_rebenchmark=True ignores the cache). CPU -> min(cpu_fallback,
-    os.cpu_count()), no benchmark.
+      * MPS  -> 0 immediately. cv2's own thread pool fights the DataLoader's
+        worker PROCESSES on Apple Silicon (see data_handler.py's
+        worker_init_fn comment), and data loading isn't the bottleneck there
+        anyway -- the MacBook Air M4 sweep in config.py measured pure data
+        loading at only ~13% of total batch time, so this needs no benchmark.
+      * CUDA -> benchmarks ``NUM_WORKERS_CANDIDATES`` (4, 6, 8, 12) on THIS
+        machine's real training pipeline the first time it runs (see
+        ``_benchmark_num_workers_cuda``), preferring 6 or 8 unless another
+        candidate wins by more than 15% (``_pick_preferred_num_workers``).
+        The result is cached to ``<results_dir>/num_workers_benchmark.json``
+        keyed by ``torch.cuda.get_device_name(0)``, so every run AFTER the
+        first on a given GPU just loads the cached value. Pass
+        ``force_rebenchmark=True`` to ignore the cache (e.g. after a driver
+        or hardware change).
+      * CPU  -> ``min(cpu_fallback, os.cpu_count())``, no benchmark (data
+        loading is rarely the bottleneck when the CPU is also doing the
+        compute; extra workers would just compete with the main process for
+        cores).
+
+    Every call prints the resolved decision, mirroring config.py's existing
+    "documented decision" comment style.
     """
     if device.type == "mps":
         print("[num_workers] device=mps -> 0 (cv2/DataLoader-worker thread "
@@ -247,7 +310,8 @@ def select_num_workers(
         print(f"[num_workers] device=cpu -> {n} (min({cpu_fallback}, os.cpu_count()), no benchmark)")
         return n
 
-    # CUDA: cache-or-benchmark, keyed by GPU name so a swapped card doesn't share a stale decision
+    # CUDA: cache-or-benchmark, keyed by GPU name so different machines (or a
+    # swapped card) don't share a stale decision.
     gpu_name = torch.cuda.get_device_name(0)
     cache_path = _num_workers_cache_path(results_dir)
 
@@ -303,8 +367,10 @@ def count_parameters(model: torch.nn.Module, trainable_only: bool = True) -> int
 
 
 def assert_param_budget(model: torch.nn.Module, limit: int = 10_000_000) -> int:
-    """Raise if the model exceeds the exam's parameter cap; returns the total
-    count. Call right after building a model to fail fast on a violation."""
+    """
+    Raise if the model exceeds the exam's parameter cap. Returns the total count.
+    Call right after building a model to fail fast on a budget violation.
+    """
     total = count_parameters(model, trainable_only=False)
     if total >= limit:
         raise ValueError(f"Model has {total/1e6:.3f} M params (≥ {limit/1e6:.0f} M cap).")
@@ -312,16 +378,23 @@ def assert_param_budget(model: torch.nn.Module, limit: int = 10_000_000) -> int:
 
 
 def stage_done(*expected_paths: str | Path) -> bool:
-    """True if every expected output already exists on disk — guards an
-    expensive pipeline stage: call with the file(s) it produces and skip
-    recomputation when this returns True."""
+    """Return True if every expected output already exists on disk.
+
+    Use this to guard an expensive pipeline stage: call it with the file(s)
+    that stage is supposed to produce, and skip recomputation (loading the
+    existing outputs instead) when it returns True.
+    """
     return all(Path(p).exists() for p in expected_paths)
 
 
 def is_fresh(target: str | Path, *dep_paths: str | Path) -> bool:
-    """True if target exists and is at least as new (by mtime) as every
-    existing path in dep_paths (missing deps are ignored). Used to decide
-    whether a derived artifact needs rebuilding after its inputs changed."""
+    """
+    True if ``target`` exists and is at least as new as every existing path in
+    ``dep_paths`` (by mtime). Dependencies that don't exist are ignored (a
+    missing upstream file can't make a target stale). Used to decide whether a
+    derived artifact (e.g. the cleaned-manifest CSV) needs rebuilding after its
+    inputs (e.g. the outlier-review CSVs) changed.
+    """
     target = Path(target)
     if not target.exists():
         return False
@@ -331,12 +404,17 @@ def is_fresh(target: str | Path, *dep_paths: str | Path) -> bool:
 
 
 class LocalEarlyStopper:
-    """Per-candidate early-stop tracker for a hyperparameter-search loop (not
-    Trainer's own PATIENCE, which governs the Phase C full retrain).
-    Instantiate one fresh tracker per candidate, call update(metric) after
-    every epoch with a higher-is-better value, and stop once it returns True.
-    best always holds the best value seen, so a candidate that stopped early
-    is still ranked by its best (not final) epoch."""
+    """
+    Per-candidate early-stop tracker for a hyperparameter-SEARCH training loop
+    (NOT the same thing as Trainer's own PATIENCE, which governs the Phase C
+    full retrain of the winning config).
+
+    Instantiate ONE fresh tracker per candidate config so state never leaks
+    between candidates, call ``update(metric)`` after every epoch with a
+    "higher is better" value, and stop the loop as soon as it returns True.
+    ``best`` always holds the best value seen so far, so callers can rank a
+    candidate that stopped early by its best (not final) epoch.
+    """
 
     def __init__(self, patience: int, min_delta: float = 1e-4) -> None:
         self.patience = patience
@@ -355,7 +433,7 @@ class LocalEarlyStopper:
 
 
 def format_time(seconds: float) -> str:
-    """Seconds -> HH:MM:SS."""
+    """Seconds → HH:MM:SS."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)

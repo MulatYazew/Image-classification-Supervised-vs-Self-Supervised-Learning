@@ -1,23 +1,36 @@
 """
 FoodNet — Self-Supervised Learning (SSL) Task
 ==============================================
-The exam's second paradigm: pretrain the same custom backbone (codes.model)
-without labels, extract features, and classify them with a traditional
-classifier.
+Implements the SECOND paradigm required by the exam:
 
-Pipeline: (1) pretrain the backbone via a pretext task — "simclr" (contrastive
-NT-Xent on two augmented views, default) or "rotation" (predict a 4-way
-{0,90,180,270} rotation); (2) freeze the backbone and extract penultimate
-features (forward_features); (3) fit a traditional classifier (logreg/linear
-SVM/kNN) on train features, score on val (=test) features. SL and SSL are
-then compared on identical splits/metrics, so the only variable is whether
-the backbone saw labels.
+    "compare the performance with CNNs trained in Self-Supervised Learning
+     (even on the same dataset ignoring the labels), extracting the features
+     and classifying them with a traditional classifier."
 
-Efficiency: AMP autocast + GradScaler on CUDA (~2x faster, half memory); MPS/
-CPU run full precision. SimCLR LR scales linearly with batch size (SimCLR
-rule — contrastive loss is batch-size sensitive). The traditional classifier
-defaults to fast SAGA logistic regression (one-vs-rest LinearSVC over 251
-classes on high-dim features is slow).
+Pipeline
+--------
+    1. Pretrain the SAME custom backbone (codes.model) WITHOUT labels via a
+       pretext task:
+         * "simclr"   — contrastive NT-Xent on two augmented views (default).
+         * "rotation" — predict the 4-way rotation {0,90,180,270} of an image.
+    2. Freeze the backbone and extract penultimate features (forward_features).
+    3. Fit a TRADITIONAL classifier (logistic regression / linear SVM / kNN) on
+       the train features and evaluate on the validation (= test) features.
+
+The SL and SSL results are then compared in the report on identical splits and
+metrics, so the only thing that changes between them is *how the backbone was
+trained* (with vs without labels).
+
+Efficiency notes
+-------------------------------------------------------------------------
+  * Mixed-precision (AMP) autocast + GradScaler — ~2x faster, half the memory,
+    on CUDA. Enabled automatically when the resolved device is CUDA; on MPS
+    (Apple Silicon) / CPU the pretraining runs full precision (no crash, no AMP).
+  * SimCLR LR is scaled linearly with batch size (lr = base_lr * B / 256), the
+    standard SimCLR rule — contrastive learning is very batch-size sensitive.
+  * The traditional classifier defaults to a fast SAGA logistic regression;
+    a one-vs-rest LinearSVC over 251 classes on high-dim features is slow, so
+    we standardise features and cap iterations sensibly.
 """
 
 from __future__ import annotations
@@ -38,19 +51,23 @@ from .model import BaseModel
 from .utils import get_device, LocalEarlyStopper, make_amp_context
 
 
-# Projection head (SimCLR)
+
+#  Projection head (SimCLR) 
 
 class ProjectionHead(nn.Module):
-    """2-layer MLP mapping backbone features to contrastive space. SimCLR
-    contrasts in this projection space, not the feature space — the head is
-    used only during pretraining and discarded afterwards, so the downstream
-    classifier sees the richer pre-projection embedding (forward_features)."""
+    """
+    2-layer MLP projection head mapping backbone features → contrastive space.
+
+    SimCLR contrasts in the projection space, not the feature space: the head
+    is used ONLY during pretraining and discarded afterwards, so the downstream
+    classifier sees the richer pre-projection embedding (``forward_features``).
+    """
 
     def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 128) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),         # stabilises contrastive training
+            nn.BatchNorm1d(hidden_dim),         # BN here stabilises contrastive training
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -59,30 +76,44 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
-# SimCLR contrastive pretraining
+#  SimCLR contrastive pretraining 
 
 def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs: int = 100,lr: float = 1e-3,
                     weight_decay: float = 1e-4,temperature: float = 0.5, projection_dim: int = 128,
                     batch_size_ref: int = 256, use_amp: bool = True, save_path: str | Path | None = None,
                     early_stop_patience: int = 0,
                     eval_fn: Callable[[], float] | None = None) -> dict[str, list[float]]:
-    """Contrastively pretrain backbone.forward_features with NT-Xent.
-    ssl_loader yields (view1, view2) pairs with no labels (two independent
-    augmentations of the same image). The projection head is discarded after
-    pretraining; only backbone weights are kept.
+    """
+    Contrastively pretrain ``backbone.forward_features`` with NT-Xent.
 
-    lr is the base LR for a 256-sample batch; the effective LR scales
-    linearly with the real batch size (SimCLR rule — contrastive loss quality
-    depends on the number of negatives, ~batch size). early_stop_patience > 0
-    stops once eval_fn hasn't improved for that many epochs (search-loop
-    early stop, see hyperparameter_tuning.probe_ssl); eval_fn is a zero-arg
-    "higher is better" callable, only invoked when early_stop_patience > 0 so
-    a normal run_ssl_pipeline call pays zero overhead for it.
+    ``ssl_loader`` must yield pairs ``(view1, view2)`` with NO labels
+    (two independent augmentations of the same image). The projection head is
+    discarded after pretraining; only the backbone weights are kept.
+
+    Args:
+        lr            : base LR for a 256-sample batch. The effective LR is
+                        scaled linearly with the real batch size (SimCLR rule),
+                        because contrastive loss quality depends strongly on the
+                        number of negatives (≈ batch size).
+        batch_size_ref: reference batch size for the linear LR scaling.
+        use_amp       : enable mixed-precision autocast (faster / less memory).
+        early_stop_patience : if > 0, stop once ``eval_fn`` hasn't improved for
+                        this many epochs (search-loop early stop — see
+                        ``hyperparameter_tuning.probe_ssl``). 0 (default)
+                        disables it, matching the original full-pretraining
+                        behaviour used by ``run_ssl_pipeline``.
+        eval_fn       : optional zero-arg callable returning a "higher is
+                        better" metric, called after every epoch when
+                        ``early_stop_patience`` > 0 (e.g. a downstream
+                        classifier's validation macro-F1). Ignored otherwise —
+                        it is NOT called during a normal (non-search) run, so
+                        it adds zero overhead there.
     """
     backbone = backbone.to(device)
     proj = ProjectionHead(backbone.feature_dim, hidden_dim=512, out_dim=projection_dim).to(device)
     criterion = NTXentLoss(temperature=temperature)
 
+    # Linear LR scaling: infer the real batch size from the first batch.
     try:
         sample_view1, _ = next(iter(ssl_loader))
         real_bs = sample_view1.size(0)
@@ -94,7 +125,9 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
     optimizer = AdamW(list(backbone.parameters()) + list(proj.parameters()),
                       lr=scaled_lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    # autocast also engages on MPS (measured speedup on this M4); GradScaler stays CUDA-only
+    # Autocast now also engages on MPS (measured speedup on this M4 Mac -- see
+    # config.AMP_MPS_DTYPE); GradScaler stays CUDA-only since MPS doesn't
+    # need/support the same overflow-scaling machinery.
     amp_on, amp_dtype, scaler = make_amp_context(use_amp, device)
 
     history: dict[str, list[float]] = {"ssl_loss": []}
@@ -107,11 +140,11 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
             view1, view2 = view1.to(device, non_blocking=True), view2.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=amp_on):
-                z1 = proj(backbone.forward_features(view1))   # project both views...
+                z1 = proj(backbone.forward_features(view1))   # project both views …
                 z2 = proj(backbone.forward_features(view2))
-                loss = criterion(z1, z2)                       # ...and contrast them
+                loss = criterion(z1, z2)                       # … and contrast them
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer)                         # unscale before clipping
             nn.utils.clip_grad_norm_(list(backbone.parameters()) + list(proj.parameters()), 1.0)
             scaler.step(optimizer)
             scaler.update()
@@ -140,7 +173,7 @@ def pretrain_simclr(backbone: BaseModel, ssl_loader, device: torch.device,epochs
     return history
 
 
-# Rotation-prediction pretraining (alternative pretext)
+#  Rotation-prediction pretraining (alternative pretext) 
 
 def pretrain_rotation(
     backbone: BaseModel,
@@ -155,14 +188,20 @@ def pretrain_rotation(
     early_stop_patience: int = 0,
     eval_fn: Callable[[], float] | None = None,
 ) -> dict[str, list[float]]:
-    """Rotation-prediction pretext (Gidaris et al., 2018): each image is
-    rotated by one of {0,90,180,270} degrees and the backbone + a 4-way head
-    predicts which. Labels in feature_loader are ignored; the rotation index
-    is the self-supervised target. Source batch is capped at max_rot_batch
-    before the 4x rotation expansion to avoid OOM.
+    """
+    Rotation-prediction pretext (Gidaris et al., 2018).
 
-    early_stop_patience/eval_fn follow the same search-loop early-stop
-    contract as pretrain_simclr (both default disabled).
+    Each image is rotated by one of {0°, 90°, 180°, 270°} and the backbone + a
+    4-way head must predict which. Labels in ``feature_loader`` are ignored —
+    the rotation index is the self-supervised target.
+
+    NOTE: building all 4 rotations stacks a 4x-sized tensor in memory. To avoid
+    OOM with large input batches we cap the effective rotation batch at
+    ``max_rot_batch`` by trimming the source batch before expansion.
+
+    ``early_stop_patience`` / ``eval_fn`` : same search-loop early-stop contract
+    as ``pretrain_simclr`` (see its docstring); both default to disabled so a
+    normal ``run_ssl_pipeline`` call is unaffected.
     """
     backbone = backbone.to(device)
     rot_head = nn.Linear(backbone.feature_dim, 4).to(device)   # 4-way rotation classifier
@@ -180,9 +219,11 @@ def pretrain_rotation(
         running, correct, n = 0.0, 0, 0
         for images, _ in feature_loader:                       # labels ignored
             images = images.to(device, non_blocking=True)
-            cap = max(1, max_rot_batch // 4)   # keep the 4x expansion within the memory cap
+            # Trim so the 4x expansion stays within the memory cap.
+            cap = max(1, max_rot_batch // 4)
             if images.size(0) > cap:
                 images = images[:cap]
+            # Build the 4 rotations and their target indices.
             batch, targets = [], []
             for k in range(4):
                 batch.append(torch.rot90(images, k, dims=(2, 3)))
@@ -226,7 +267,7 @@ def pretrain_rotation(
     return history
 
 
-# Feature extraction
+#  Feature extraction 
 
 @torch.no_grad()
 def extract_features(
@@ -235,11 +276,14 @@ def extract_features(
     device: torch.device,
     l2_normalize: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run the frozen backbone over loader (yielding (image, label)) and
-    return (features, labels) — features are forward_features' penultimate
-    embeddings. L2-normalising puts every embedding on the unit sphere, which
-    is what cosine-based/linear classifiers expect and what SimCLR trained
-    the space to be."""
+    """
+    Run the FROZEN backbone over ``loader`` and return ``(features, labels)``.
+
+    ``loader`` yields ``(image, label)``. Features are the penultimate
+    embeddings from ``forward_features``. L2-normalising them puts every
+    embedding on the unit sphere, which is what cosine-based / linear
+    classifiers expect and what SimCLR trained the space to be.
+    """
     backbone = backbone.to(device).eval()
     feats_list, labels_list = [], []
     for images, labels in loader:
@@ -252,7 +296,7 @@ def extract_features(
     return np.concatenate(feats_list), np.concatenate(labels_list)
 
 
-# Traditional classifier on frozen features
+#  Traditional classifier on frozen features 
 
 def fit_traditional_classifier(
     train_feats: np.ndarray,
@@ -260,25 +304,33 @@ def fit_traditional_classifier(
     classifier: str = "logreg",
     seed: int = 42,
 ):
-    """Fit a traditional classifier (logreg: multinomial SAGA | linear_svm |
-    knn) on SSL features. Returns a fitted sklearn Pipeline (StandardScaler
-    -> estimator); standardising first speeds up and stabilises the linear
-    solvers on 251-class, high-dimensional features.
+    """
+    Fit a traditional classifier on the SSL features.
 
-    The pretext task itself needs no imbalance correction (NT-Xent ignores
-    labels), but this read-out classifier is fit on labels and inherits the
-    same ~19:1 imbalance as the supervised task, so logreg/linear_svm get
-    class_weight="balanced". KNN has no class_weight — weights="distance" is
-    its closest lever, avoiding a dense majority-class neighbourhood
-    dominating a tied vote.
+    Args:
+        classifier : 'logreg' (multinomial SAGA) | 'linear_svm' | 'knn'.
+
+    Returns:
+        A fitted scikit-learn ``Pipeline`` (StandardScaler → estimator) exposing
+        ``.predict``. Standardising first markedly speeds up and stabilises the
+        linear solvers on 251-class, high-dimensional features.
+
+    Class imbalance: the SSL pretext task itself needs no correction (NT-Xent
+    ignores labels), but this READ-OUT classifier is fit on labels and inherits
+    the same ~19:1 imbalance as the supervised task, so it gets the same
+    ``class_weight="balanced"`` treatment for the estimators that support it
+    (logreg, linear_svm). KNN has no ``class_weight`` parameter — its closest
+    lever is ``weights="distance"`` (already set below), which at least avoids
+    letting a dense majority-class neighbourhood dominate a tied vote.
     """
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     if classifier == "logreg":
-        # SAGA handles 251-class softmax (multinomial) far better than
-        # one-vs-rest; capped iterations keep it fast. Recent scikit-learn
-        # defaults saga to multinomial automatically (no multi_class arg needed).
+        # SAGA solver handles 251 classes with softmax (multinomial) far better
+        # than one-vs-rest; capped iterations keep it fast (efficiency grade).
+        # Note: recent scikit-learn defaults saga to multinomial automatically,
+        # so we don't pass the (now-removed in some versions) multi_class arg.
         from sklearn.linear_model import LogisticRegression
         clf = LogisticRegression(
             solver="saga", max_iter=200, C=1.0, n_jobs=-1, random_state=seed,
@@ -293,7 +345,7 @@ def fit_traditional_classifier(
     else:
         raise ValueError(f"Unknown classifier '{classifier}'. Choose: logreg, linear_svm, knn.")
 
-    pipe = make_pipeline(StandardScaler(), clf)
+    pipe = make_pipeline(StandardScaler(), clf)   # scale → classify
     pipe.fit(train_feats, train_labels)
     return pipe
 
@@ -315,18 +367,27 @@ def run_ssl_pipeline(
     save_path: str | Path | None = None,
     seed: int = 42,
 ) -> dict:
-    """End-to-end SSL task: pretrain -> freeze -> extract features -> fit &
-    score a traditional classifier on train/val(=test) splits. device
-    defaults to utils.get_device(). seed forwards to
-    fit_traditional_classifier (config.SEED).
+    """
+    End-to-end SSL task: pretrain → freeze → extract features → fit & score a
+    traditional classifier on train/val (= test) splits.
 
-    Returns a dict with the SSL training history, fitted classifier,
-    extracted feature arrays, and train/val predictions+labels — hand val_*
-    to evaluate.Evaluator for the same metrics used in the SL task (apples-
-    to-apples comparison). train_predictions is also returned so the
-    downstream classifier's own train-vs-val accuracy/macro-F1 can be
-    measured (whether the logreg/linear_svm/knn head over/underfits the
-    frozen features — a question the NT-Xent pretext loss says nothing about).
+    ``device`` defaults to ``utils.get_device()`` when omitted, so the pipeline
+    resolves to MPS on the Mac and CUDA on a CUDA PC with no edits.
+
+    ``seed`` is forwarded to ``fit_traditional_classifier`` (config.SEED, so
+    the notebook's single seed knob actually reaches the read-out classifier
+    instead of a hardcoded literal).
+
+    Returns a dict with the SSL training history, the fitted classifier, the
+    extracted feature arrays, and validation predictions/labels (hand these to
+    codes.evaluate.Evaluator for the SAME metrics used in the SL task, so the
+    SL-vs-SSL comparison is apples-to-apples).
+
+    The classifier's TRAIN predictions are also returned (``train_predictions``)
+    alongside its VAL predictions, so the downstream (read-out) classifier's own
+    train-vs-val accuracy/macro-F1 can be measured -- i.e. whether the
+    logreg/linear_svm/knn head over- or under-fits the frozen SimCLR features,
+    a question the pretext loss curve (NT-Xent) says nothing about.
     """
     device = device or get_device()
     if method == "simclr":
