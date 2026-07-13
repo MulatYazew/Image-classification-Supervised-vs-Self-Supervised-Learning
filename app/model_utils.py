@@ -26,6 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from codes import config as C
 from codes import data_handler as dh
 from codes import model as M
+from codes.gradcam import GradCAM
 
 
 class ArtifactError(RuntimeError):
@@ -172,3 +173,24 @@ def predict_self_supervised(backbone, classifier, tensor: torch.Tensor, device: 
 
     pred = int(classifier.predict(feats)[0])
     return [(class_names.get(pred, f"class_{pred}"), 1.0)]
+
+
+def build_gradcam(model) -> GradCAM:
+    """Wrap `model` in a codes.gradcam.GradCAM explainer.
+
+    The caller (app.py) should stash the returned object behind
+    st.cache_resource so the forward/backward hooks are registered once per
+    process instead of on every Streamlit rerun.
+    """
+    return GradCAM(model)
+
+
+def generate_gradcam_overlay(gradcam: GradCAM, tensor: torch.Tensor, image: Image.Image,
+                             device: torch.device, class_idx: int | None = None) -> np.ndarray:
+    """Grad-CAM heatmap overlaid on `image`, explaining `gradcam`'s wrapped
+    model's prediction on `tensor` (the same preprocessed input passed to
+    predict_supervised). class_idx=None explains the model's own top prediction.
+    """
+    heatmap = gradcam.generate(tensor.to(device), class_idx=class_idx)
+    resized = np.array(image.convert("RGB").resize((tensor.shape[-1], tensor.shape[-2])))
+    return gradcam.overlay(resized, heatmap)

@@ -53,6 +53,12 @@ def get_class_names():
     return mu.load_class_names()
 
 
+@st.cache_resource
+def get_supervised_gradcam():
+    model, _, _ = get_supervised()
+    return mu.build_gradcam(model) if model is not None else None
+
+
 # Background styling
 
 def inject_background(image_path: Path) -> None:
@@ -117,6 +123,10 @@ if not mode_options:
 
 mode = st.sidebar.radio("Prediction mode", mode_options, index=len(mode_options) - 1)
 top_k = st.sidebar.slider("Top-K predictions", min_value=1, max_value=10, value=5)
+show_gradcam = st.sidebar.checkbox(
+    "Show Grad-CAM (supervised)", value=False, disabled=sl_model is None,
+    help="Class-activation heatmap showing which image regions drove the supervised model's prediction.",
+)
 
 # Model card
 with st.expander("Model card", expanded=False):
@@ -197,6 +207,12 @@ for uploaded_file in uploaded_files:
         render_predictions(target, "Self-Supervised", ssl_preds)
         row["self_supervised_predicted_class"] = ssl_preds[0][0]
         row["self_supervised_confidence"] = ssl_preds[0][1]
+
+    if show_gradcam and sl_model is not None:
+        with st.expander(f"Grad-CAM — {uploaded_file.name}", expanded=False):
+            gradcam = get_supervised_gradcam()
+            heatmap_img = mu.generate_gradcam_overlay(gradcam, tensor, image, device)
+            st.image(heatmap_img, caption="Supervised model — class activation heatmap", width="stretch")
 
     summary_rows.append(row)
 
